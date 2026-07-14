@@ -9,7 +9,7 @@ The workflow includes:
 - strict reuse of prespecified five-fold internal cross-validation assignments;
 - three clinicopathological feature configurations: PCI, PPEI, and ICPI;
 - comparisons among TabPFN, TabNet, XGBoost, LightGBM, Random Forest, CNLC, and BCLC;
-- a prespecified 3-month interval-gap temporal validation;
+- the sole prespecified S3 3-month interval-gap temporal validation;
 - bootstrap confidence intervals, calibration assessment, decision-curve analysis,
   paired AUROC comparisons, and optional SHAP analysis.
 
@@ -45,13 +45,13 @@ generates replacement folds.
 Continuous tumour size is represented by the largest recorded diameter.
 The binary indicator `Tumor Size >5 cm` is included only in ICPI.
 
-### Interval-gap temporal validation
+### Prespecified S3 interval-gap temporal validation
 
-The final temporal protocol uses:
+The sole temporal experiment uses the prespecified S3 protocol:
 
-- development period: 2015-10-05 to 2019-09-30;
-- excluded 3-month interval: 2019-10-01 to 2019-12-31;
-- temporal validation period: 2020-01-01 to 2020-12-25;
+- development period: 2015-10-05 to 2019-06-30;
+- excluded 3-month interval: 2019-07-01 to 2019-09-30;
+- temporal validation period: 2019-10-01 to 2020-12-25;
 - endpoints: OS12m, OS24m, RFS12m, and RFS24m;
 - preprocessing fitted on the complete development set and applied unchanged
   to the temporal validation set;
@@ -59,6 +59,10 @@ The final temporal protocol uses:
 - a fixed classification threshold of 0.5 for every model;
 - a 20-seed TabNet probability-mean ensemble using seeds 42–61 and 100 fixed
   epochs per member.
+
+The program does not search across alternative temporal cut-offs and does not
+select a split according to model performance. S3 is the only temporal
+experiment defined and executed by the public main program.
 
 ## Input requirements
 
@@ -184,7 +188,7 @@ outputs/hcc_postoperative_prognosis_benchmark/
 Major subdirectories include:
 
 - `cv/`: fold-level and pooled internal cross-validation results;
-- `temporal/`: full-development interval-gap temporal validation results;
+- `temporal/`: the sole prespecified S3 full-development interval-gap temporal validation results;
 - `summary/`: consolidated result tables and source-data workbooks;
 - `reproducibility/`: parameters, seeds, software metadata, file hashes, and GPU logs.
 
@@ -194,7 +198,7 @@ Major subdirectories include:
 - Temporal TabNet seeds: 42–61; all 20 probabilities are averaged.
 - The pipeline never silently generates new internal folds.
 - Preprocessing is fitted separately within each CV training fold.
-- Temporal preprocessing is fitted once on the complete development set.
+- S3 temporal preprocessing is fitted once on the complete 2015-10-05 to 2019-06-30 development set.
 - Direct identifiers are used internally only to validate alignment with the
   prespecified fold file unless explicitly exported.
 

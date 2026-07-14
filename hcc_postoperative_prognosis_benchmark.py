@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HCC postoperative prognosis benchmark — fixed-fold cross-validation and interval-gap temporal validation.
+HCC postoperative prognosis benchmark — fixed-fold cross-validation and prespecified S3 temporal validation.
 
 This single script retains the original strict five-fold internal CV benchmark
-and implements the final full-development interval-gap temporal validation protocol.
+and implements the sole prespecified S3 full-development interval-gap temporal validation protocol.
 
 Final analysis definition
 -------------------------
@@ -16,7 +16,7 @@ Final analysis definition
 - "无" and unresolvable abnormal values become missing before training-set-only KNN
 - Initial treatment date is used only for temporal splitting
 - Internal CV keeps three feature-set workers and the original CV model protocol
-- Temporal validation uses all development-period patients for training, with no internal split or cross-validation
+- S3 temporal validation uses all development-period patients for training, with no internal split or cross-validation
 - Temporal validation is restricted to OS12m, OS24m, RFS12m and RFS24m
 - Temporal classification threshold is prespecified at 0.5 for every model
 - Temporal TabNet is a 20-seed (42–61), 100-epoch probability-mean ensemble
@@ -127,12 +127,13 @@ BCLC_CANDIDATES = [
 ]
 
 TEMPORAL_DEV_START = pd.Timestamp("2015-10-05")
-TEMPORAL_DEV_END = pd.Timestamp("2019-09-30")
-TEMPORAL_GAP_START = pd.Timestamp("2019-10-01")
-TEMPORAL_GAP_END = pd.Timestamp("2019-12-31")
-TEMPORAL_VAL_START = pd.Timestamp("2020-01-01")
+TEMPORAL_DEV_END = pd.Timestamp("2019-06-30")
+TEMPORAL_GAP_START = pd.Timestamp("2019-07-01")
+TEMPORAL_GAP_END = pd.Timestamp("2019-09-30")
+TEMPORAL_VAL_START = pd.Timestamp("2019-10-01")
 TEMPORAL_VAL_END = pd.Timestamp("2020-12-25")
-TEMPORAL_SPLIT_NAME = "temporal_gap3m_2019Q4_to_2020_full_development"
+TEMPORAL_SPLIT_NAME = "S3_gap3m_2019Q4_to_2020"
+TEMPORAL_SPLIT_IS_SOLE_PRESPECIFIED_ANALYSIS = True
 
 # Canonical names are resolved against aliases, then actual Excel column names are used.
 FEATURE_ALIASES: Dict[str, List[str]] = {
@@ -2110,7 +2111,7 @@ def export_temporal_excel_summary(
     temporal_root: Path,
     tables: Dict[str, pd.DataFrame],
 ) -> None:
-    path = temporal_root / "temporal_full_development_summary.xlsx"
+    path = temporal_root / "temporal_S3_summary.xlsx"
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         wrote_sheet = False
         for sheet, frame in tables.items():
@@ -2134,7 +2135,7 @@ def run_temporal_validation(
     configure_worker_threads(cfg.model_n_jobs)
     temporal_root = ensure_dir(Path(cfg.output_root) / "temporal")
     log_file = temporal_root / "run.log"
-    log_line("Full-development interval-gap temporal validation started", log_file)
+    log_line("Prespecified S3 full-development interval-gap temporal validation started", log_file)
 
     study_id_map = build_study_id_map(df)
     all_results: List[Dict[str, Any]] = []
@@ -2415,7 +2416,7 @@ def run_temporal_validation(
     )
     completion = {
         "completed": True,
-        "protocol": "temporal_full_development_gap3m",
+        "protocol": "temporal_S3_full_development_gap3m",
         "primary_rows": len(results_df),
         "expected_primary_rows_for_requested_models": expected_rows,
         "primary_ok": int((results_df["status"] == "ok").sum()) if not results_df.empty else 0,
@@ -2731,6 +2732,8 @@ def save_reproducibility(output_root: Path, args: argparse.Namespace, feature_se
     params["expected_feature_counts"] = EXPECTED_FEATURE_COUNTS
     params["temporal_design"] = {
         "protocol": "full-development interval-gap fixed protocol",
+        "split_name": TEMPORAL_SPLIT_NAME,
+        "sole_prespecified_temporal_experiment": True,
         "training": f"{TEMPORAL_DEV_START.date()} to {TEMPORAL_DEV_END.date()}",
         "gap": f"{TEMPORAL_GAP_START.date()} to {TEMPORAL_GAP_END.date()}",
         "validation": f"{TEMPORAL_VAL_START.date()} to {TEMPORAL_VAL_END.date()}",
@@ -2843,7 +2846,43 @@ def resolve_feature_sets_strict(df: pd.DataFrame, id_col: str, time_col: str, ic
     return feature_sets, pd.DataFrame(audit)
 
 
+def validate_temporal_s3_definition() -> None:
+    """Fail fast if the public main program no longer matches the prespecified S3 design."""
+    expected = {
+        "development_start": pd.Timestamp("2015-10-05"),
+        "development_end": pd.Timestamp("2019-06-30"),
+        "gap_start": pd.Timestamp("2019-07-01"),
+        "gap_end": pd.Timestamp("2019-09-30"),
+        "validation_start": pd.Timestamp("2019-10-01"),
+        "validation_end": pd.Timestamp("2020-12-25"),
+        "split_name": "S3_gap3m_2019Q4_to_2020",
+    }
+    actual = {
+        "development_start": TEMPORAL_DEV_START,
+        "development_end": TEMPORAL_DEV_END,
+        "gap_start": TEMPORAL_GAP_START,
+        "gap_end": TEMPORAL_GAP_END,
+        "validation_start": TEMPORAL_VAL_START,
+        "validation_end": TEMPORAL_VAL_END,
+        "split_name": TEMPORAL_SPLIT_NAME,
+    }
+    mismatches = {
+        key: {"expected": expected[key], "actual": actual[key]}
+        for key in expected
+        if actual[key] != expected[key]
+    }
+    if mismatches:
+        raise ValueError(f"Temporal S3 definition mismatch: {mismatches}")
+    if not (
+        TEMPORAL_DEV_START <= TEMPORAL_DEV_END
+        < TEMPORAL_GAP_START <= TEMPORAL_GAP_END
+        < TEMPORAL_VAL_START <= TEMPORAL_VAL_END
+    ):
+        raise ValueError("Invalid temporal S3 date ordering")
+
+
 def preflight(args: argparse.Namespace, output_root: Path) -> Tuple[pd.DataFrame, str, Optional[str], Optional[str], Dict[str, List[str]]]:
+    validate_temporal_s3_definition()
     excel = Path(args.excel)
     fold = Path(args.fold_file)
     if not excel.exists():
@@ -2912,7 +2951,7 @@ def coerce_sheet_arg(value: Any) -> Any:
     return value
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="HCC fixed-fold cross-validation and full-development interval-gap temporal validation")
+    parser = argparse.ArgumentParser(description="HCC fixed-fold cross-validation and prespecified S3 interval-gap temporal validation")
     parser.add_argument("--excel", required=True, help="Private Excel input used for both CV and temporal validation")
     parser.add_argument("--sheet", default=0, help="Excel sheet name or index")
     parser.add_argument("--fold-file", required=True, help="Existing fixed fold-long CSV/XLSX; strict reuse, no fallback")
