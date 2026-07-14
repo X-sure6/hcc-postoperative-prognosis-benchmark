@@ -30,6 +30,7 @@ match the prespecified analysis. It never silently generates replacement folds. 
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -307,6 +308,7 @@ class WorkerConfig:
     models: List[str]
     tabpfn_checkpoint: str
     model_n_jobs: int
+    temporal_model_n_jobs: int
     bootstrap_rounds: int
     run_shap: bool
     shap_background: int
@@ -340,6 +342,13 @@ def log_line(message: str, log_file: Optional[str | Path] = None) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+
+def release_worker_memory() -> None:
+    """Release unreachable Python objects and unused CUDA cache between long GPU fits."""
+    gc.collect()
+    if TORCH_AVAILABLE and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def normalize_name(value: Any) -> str:
@@ -637,6 +646,38 @@ def calibration_intercept_slope(y_true: np.ndarray, y_prob: np.ndarray) -> Tuple
         return float(clf.intercept_[0]), float(clf.coef_[0, 0])
     except Exception:
         return np.nan, np.nan
+
+
+def temporal_calibration_intercept_slope(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> Tuple[float, float]:
+    """Temporal calibration using unpenalized sklearn logistic regression.
+
+    This intentionally does not call statsmodels, preserving the S3 temporal
+    implementation and avoiding convergence stalls under near separation.
+    """
+    p = np.clip(np.asarray(y_prob, dtype=float), 1e-6, 1 - 1e-6)
+    y = np.asarray(y_true, dtype=int)
+    if len(np.unique(y)) < 2:
+        return np.nan, np.nan
+    lp = np.log(p / (1 - p)).reshape(-1, 1)
+
+    # sklearn uses penalty=None in newer releases and penalty="none" in
+    # some older supported releases. Try the full fit under both spellings.
+    for penalty in (None, "none"):
+        try:
+            clf = LogisticRegression(
+                penalty=penalty,
+                solver="lbfgs",
+                max_iter=1000,
+                tol=1e-8,
+            )
+            clf.fit(lp, y)
+            return float(clf.intercept_[0]), float(clf.coef_[0, 0])
+        except Exception:
+            continue
+    return np.nan, np.nan
 
 
 def decision_curve_df(y_true: np.ndarray, y_prob: np.ndarray) -> pd.DataFrame:
@@ -1671,11 +1712,11 @@ def make_temporal_model(model_name: str, seed: int, cfg: WorkerConfig) -> BaseMo
     if model_name == "TabNet":
         return TemporalTabNetModel(seed)
     if model_name == "XGBoost":
-        return TemporalXGBoostModel(seed, cfg.model_n_jobs)
+        return TemporalXGBoostModel(seed, cfg.temporal_model_n_jobs)
     if model_name == "LightGBM":
-        return TemporalLightGBMModel(seed, cfg.model_n_jobs)
+        return TemporalLightGBMModel(seed, cfg.temporal_model_n_jobs)
     if model_name == "RandomForest":
-        return TemporalRandomForestModel(seed, cfg.model_n_jobs)
+        return TemporalRandomForestModel(seed, cfg.temporal_model_n_jobs)
     if model_name == "CNLC":
         if cfg.cnlc_col is None:
             raise ValueError("CNLC 列不存在")
@@ -1914,6 +1955,7 @@ def run_temporal_primary_model(
                 member_probabilities.append(member_prob)
                 member_metrics = compute_metrics(y_test, member_prob, TEMPORAL_FIXED_THRESHOLD)
                 member_metric_rows.append({
+                    "split_scheme": TEMPORAL_SPLIT_NAME,
                     "target": target,
                     "feature_set": feature_set,
                     "display": FEATURE_SET_DISPLAY[feature_set],
@@ -1924,6 +1966,7 @@ def run_temporal_primary_model(
                     **member_metrics,
                 })
                 member_prediction_frames.append(pd.DataFrame({
+                    "split_scheme": TEMPORAL_SPLIT_NAME,
                     "target": target,
                     "feature_set": feature_set,
                     "model": "TabNet",
@@ -1933,6 +1976,8 @@ def run_temporal_primary_model(
                     "y_true": y_test,
                     "y_prob": member_prob,
                 }))
+                del member
+                release_worker_memory()
             test_prob = np.mean(np.vstack(member_probabilities), axis=0)
             member_metrics_df = pd.DataFrame(member_metric_rows)
             member_predictions_df = pd.concat(member_prediction_frames, ignore_index=True)
@@ -1964,7 +2009,7 @@ def run_temporal_primary_model(
             ensemble_members = 1
 
         metrics = compute_metrics(y_test, test_prob, TEMPORAL_FIXED_THRESHOLD)
-        calibration_intercept, calibration_slope = calibration_intercept_slope(y_test, test_prob)
+        calibration_intercept, calibration_slope = temporal_calibration_intercept_slope(y_test, test_prob)
 
         predictions = pd.DataFrame({
             "split_scheme": TEMPORAL_SPLIT_NAME,
@@ -1998,7 +2043,7 @@ def run_temporal_primary_model(
             test_prob,
             TEMPORAL_FIXED_THRESHOLD,
             bootstrap_rounds,
-            stable_seed(target, output_feature_set, model_name, "bootstrap"),
+            stable_seed(TEMPORAL_SPLIT_NAME, target, output_feature_set, model_name, "bootstrap"),
             metadata,
         )
         bootstrap.to_csv(
@@ -2132,7 +2177,7 @@ def run_temporal_validation(
     paired_bootstrap_rounds: int,
     save_direct_identifiers: bool,
 ) -> Dict[str, pd.DataFrame]:
-    configure_worker_threads(cfg.model_n_jobs)
+    configure_worker_threads(cfg.temporal_model_n_jobs)
     temporal_root = ensure_dir(Path(cfg.output_root) / "temporal")
     log_file = temporal_root / "run.log"
     log_line("Prespecified S3 full-development interval-gap temporal validation started", log_file)
@@ -2380,7 +2425,7 @@ def run_temporal_validation(
                     merged["y_prob_TabPFN"].to_numpy(dtype=float),
                     merged["y_prob_comparison"].to_numpy(dtype=float),
                     paired_bootstrap_rounds,
-                    stable_seed(target, feature_set, model_name, "paired_bootstrap"),
+                    stable_seed(TEMPORAL_SPLIT_NAME, target, feature_set, model_name, "paired_bootstrap"),
                 )
                 paired_rows.append({
                     "target": target,
@@ -2611,7 +2656,10 @@ def export_source_data(
     feature_dict.to_excel(source5, index=False)
 
 
-def build_model_parameter_manifest(model_n_jobs: int) -> Dict[str, Any]:
+def build_model_parameter_manifest(
+    model_n_jobs: int,
+    temporal_model_n_jobs: int,
+) -> Dict[str, Any]:
     return {
         "CV": {
             "XGBoost": {"n_estimators": 400, "max_depth": 4, "learning_rate": 0.05, "subsample": 0.9, "colsample_bytree": 0.9, "n_jobs": model_n_jobs},
@@ -2622,6 +2670,8 @@ def build_model_parameter_manifest(model_n_jobs: int) -> Dict[str, Any]:
         "Temporal_Validation": {
             "training_scope": "complete development period; no internal split or CV",
             "classification_threshold": TEMPORAL_FIXED_THRESHOLD,
+            "calibration_method": "unpenalized sklearn LogisticRegression on prediction logit",
+            "model_n_jobs": temporal_model_n_jobs,
             "TabPFN": {"seed": RANDOM_STATE, "training": "complete temporal development set"},
             "TabNet": {
                 "seeds": TEMPORAL_TABNET_SEEDS,
@@ -2633,15 +2683,15 @@ def build_model_parameter_manifest(model_n_jobs: int) -> Dict[str, Any]:
             "XGBoost": {
                 "n_estimators": 400, "max_depth": 4, "learning_rate": 0.05,
                 "subsample": 0.9, "colsample_bytree": 0.9, "reg_lambda": 1.0,
-                "n_jobs": model_n_jobs, "early_stopping": False,
+                "n_jobs": temporal_model_n_jobs, "early_stopping": False,
             },
             "LightGBM": {
                 "n_estimators": 400, "learning_rate": 0.05, "num_leaves": 31,
                 "subsample": 0.9, "colsample_bytree": 0.9,
-                "n_jobs": model_n_jobs, "early_stopping": False,
+                "n_jobs": temporal_model_n_jobs, "early_stopping": False,
             },
             "RandomForest": {
-                "n_estimators": 300, "class_weight": "balanced", "n_jobs": model_n_jobs,
+                "n_estimators": 300, "class_weight": "balanced", "n_jobs": temporal_model_n_jobs,
             },
         },
     }
@@ -2751,7 +2801,10 @@ def save_reproducibility(output_root: Path, args: argparse.Namespace, feature_se
         "TabNet_temporal_ensemble_seeds": TEMPORAL_TABNET_SEEDS,
         "TabNet_seed_selection": "none; all 20 members averaged",
     }, rep / "random_seeds.json")
-    save_json(build_model_parameter_manifest(args.model_n_jobs), rep / "model_and_analysis_parameters.json")
+    save_json(
+        build_model_parameter_manifest(args.model_n_jobs, args.temporal_model_n_jobs),
+        rep / "model_and_analysis_parameters.json",
+    )
     (rep / "command_line.txt").write_text(_sanitized_command_line(args), encoding="utf-8")
     fingerprints = {}
     for label, path in [("input_excel", args.excel), ("fixed_fold_file", args.fold_file), ("tabpfn_checkpoint", args.tabpfn_checkpoint)]:
@@ -2961,7 +3014,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--icpi-feature-file", default="", help="Optional explicit 56-feature ICPI list in JSON/CSV/XLSX; default requires exactly 56 eligible columns")
     parser.add_argument("--tabpfn-checkpoint", default=os.environ.get("TABPFN_CHECKPOINT", ""), help="Optional local TabPFN checkpoint; may also be supplied through TABPFN_CHECKPOINT")
     parser.add_argument("--feature-set-workers", type=int, default=3)
-    parser.add_argument("--model-n-jobs", type=int, default=2)
+    parser.add_argument("--model-n-jobs", type=int, default=2, help="Threads per model during internal CV")
+    parser.add_argument("--temporal-model-n-jobs", type=int, default=1, help="Threads per tree model during S3 temporal validation")
     parser.add_argument("--bootstrap-rounds", type=int, default=DEFAULT_BOOTSTRAP_ROUNDS, help="Internal CV bootstrap rounds")
     parser.add_argument("--temporal-bootstrap-rounds", type=int, default=DEFAULT_TEMPORAL_BOOTSTRAP_ROUNDS, help="Temporal validation bootstrap confidence-interval rounds")
     parser.add_argument("--paired-bootstrap-rounds", type=int, default=DEFAULT_PAIRED_BOOTSTRAP_ROUNDS, help="Temporal paired AUROC bootstrap rounds versus TabPFN")
@@ -2987,6 +3041,8 @@ def main() -> None:
         raise ValueError("The prespecified analysis uses exactly three feature-set workers; set --feature-set-workers 3")
     if args.model_n_jobs < 1:
         raise ValueError("--model-n-jobs 必须 >=1")
+    if args.temporal_model_n_jobs < 1:
+        raise ValueError("--temporal-model-n-jobs 必须 >=1")
     output_root = Path(args.output).resolve()
     check_disk_space(output_root, args.minimum_free_gb, args.allow_low_disk)
     prepare_output_root(output_root, args.overwrite)
@@ -3011,7 +3067,9 @@ def main() -> None:
         time_col=args.time_col, id_col=id_col, cnlc_col=cnlc_col, bclc_col=bclc_col,
         feature_sets=feature_sets, models=list(args.models),
         tabpfn_checkpoint=str(Path(args.tabpfn_checkpoint).resolve()) if args.tabpfn_checkpoint else "",
-        model_n_jobs=args.model_n_jobs, bootstrap_rounds=args.bootstrap_rounds,
+        model_n_jobs=args.model_n_jobs,
+        temporal_model_n_jobs=args.temporal_model_n_jobs,
+        bootstrap_rounds=args.bootstrap_rounds,
         run_shap=not args.skip_shap, shap_background=args.shap_background,
         shap_test=args.shap_test, save_fold_data=args.save_fold_data,
         save_direct_identifiers=args.save_direct_identifiers,

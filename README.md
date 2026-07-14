@@ -57,8 +57,9 @@ The sole temporal experiment uses the prespecified S3 protocol:
   to the temporal validation set;
 - no internal temporal split and no temporal cross-validation;
 - a fixed classification threshold of 0.5 for every model;
+- temporal calibration estimated with unpenalized scikit-learn logistic regression;
 - a 20-seed TabNet probability-mean ensemble using seeds 42–61 and 100 fixed
-  epochs per member.
+  epochs per member, with GPU cache cleanup after each member.
 
 The program does not search across alternative temporal cut-offs and does not
 select a split according to model performance. S3 is the only temporal
@@ -152,6 +153,13 @@ python hcc_postoperative_prognosis_benchmark.py \
   --output outputs/hcc_postoperative_prognosis_benchmark
 ```
 
+The default thread settings preserve the original component protocols:
+
+```text
+--model-n-jobs 2
+--temporal-model-n-jobs 1
+```
+
 Display all command-line options:
 
 ```bash
@@ -195,6 +203,8 @@ Major subdirectories include:
 ## Reproducibility notes
 
 - Random seed for non-TabNet models: 42.
+- Internal CV tree-model threads default to 2; S3 temporal tree-model threads default to 1.
+- Temporal bootstrap seeds include the S3 split name for exact deterministic regeneration.
 - Temporal TabNet seeds: 42–61; all 20 probabilities are averaged.
 - The pipeline never silently generates new internal folds.
 - Preprocessing is fitted separately within each CV training fold.
