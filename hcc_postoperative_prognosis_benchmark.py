@@ -22,6 +22,9 @@ Final analysis definition
 - Temporal TabNet is a 20-seed (42–61), 100-epoch probability-mean ensemble
 - Temporal bootstrap CIs, calibration, DCA and paired bootstrap comparisons are exported
 - Random seed for non-TabNet models: 42
+- V8 predictor roles are locked to 31 continuous and 25 categorical variables
+- Deterministic V8 cleaning, derived-indicator reconciliation, and manual-review audits are exported
+- Optional parallel CV/temporal scheduling uses Linux process-level GPU slot locks
 
 The script fails before model fitting when input, features or fixed folds do not
 match the prespecified analysis. It never silently generates replacement folds. Patient-level data and fold files are not included in the repository.
@@ -31,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import contextlib
 import hashlib
 import json
 import math
@@ -45,6 +49,11 @@ import threading
 import time
 import traceback
 import warnings
+
+try:
+    import fcntl  # Linux process-level GPU slot locks
+except Exception:
+    fcntl = None
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -209,6 +218,48 @@ TREATMENT_PATTERNS = [
     r"中药", r"治疗",
 ]
 
+# Locked variable-role schema for the 56-predictor V8 dataset.  This avoids
+# fold-dependent type inference and prevents continuous laboratory variables
+# containing a few source strings from becoming high-cardinality categories.
+V8_CONTINUOUS_COLUMNS = {
+    "年龄（岁）",
+    "术前AFP (ng/ml)", "术前CEA (ng/ml)", "术前CA125（U/ml）",
+    "术前CA199（U/ml）", "HBV-DNA（IU/ml）",
+    "术前AST（U/L）", "术前 ALT（U/L）", "术前总胆红素（umol/L）",
+    "术前直接胆红素（umol/L）", "术前总蛋白（g/L）",
+    "术前白蛋白（g/L）", "术前白球比",
+    "术后 AST（U/L）", "术后 ALT（U/L）",
+    "术后总胆红素postoperative total bilirubin（umol/L）",
+    "术后直接胆红素（umol/L）", "术后总蛋白（g/L）",
+    "术后白蛋白（g/L）", "术后白球比",
+    "中性粒（*109/L）", "淋巴", "血小板", "凝血酶原时间",
+    "NLR", "PLR", "ALBI", "FIB-4",
+    "肿瘤大小(CM)", "切缘", "TB数量",
+}
+
+V8_CATEGORICAL_COLUMNS = {
+    "性别（男 1,女 0）", "肝硬化（是 1,否 0）",
+    "TB（YES 1,NO 0）", "MVI（YES 1,NO 0）",
+    "T", "N", "M", "AFP＞400", "病毒性肝炎（是1，否0）",
+    "术式", "分化程度（高分化 1，中分化 2，低分化3）",
+    "术后靶向（是1，否0）", "术后化疗（是1，否0）",
+    "术后放疗（是1，否0）", "术后免疫治疗（是1，否0）",
+    "术后中药（是1，否0）", "术后预防性TACE",
+    "ALBI分级", "child-pugh分级（1=A，2=B）",
+    "CNLC分期（1=Ia，2=Ib，3=IIa,4=IIb，5=IIIa，6=IIIb）",
+    "BCLC分期（0=0期，1=A，2=B,3=C,4=D）",
+    "肿瘤多发", "肿瘤长径大于5cm", "切缘小于等于1cm", "MVI分级",
+}
+
+V8_TREATMENT_COLUMNS = {
+    "术后靶向（是1，否0）", "术后化疗（是1，否0）",
+    "术后放疗（是1，否0）", "术后免疫治疗（是1，否0）",
+    "术后中药（是1，否0）", "术后预防性TACE",
+}
+V8_HBV_DNA_COLUMNS = {"HBV-DNA（IU/ml）", "HBV DNA", "HBV-DNA"}
+V8_SURGERY_COLUMNS = {"术式", "Surgery"}
+GPU_MODELS = {"TabPFN", "TabNet"}
+
 # -----------------------------------------------------------------------------
 # Optional dependencies
 # -----------------------------------------------------------------------------
@@ -310,6 +361,8 @@ class WorkerConfig:
     model_n_jobs: int
     temporal_model_n_jobs: int
     bootstrap_rounds: int
+    gpu_concurrency: int
+    gpu_lock_dir: str
     run_shap: bool
     shap_background: int
     shap_test: int
@@ -359,6 +412,65 @@ def normalize_name(value: Any) -> str:
         .replace("，", ",").replace("：", ":").replace("／", "/")
         .lower()
     )
+
+
+V8_CONTINUOUS_NORMALIZED = {normalize_name(x) for x in V8_CONTINUOUS_COLUMNS}
+V8_CATEGORICAL_NORMALIZED = {normalize_name(x) for x in V8_CATEGORICAL_COLUMNS}
+V8_TREATMENT_NORMALIZED = {normalize_name(x) for x in V8_TREATMENT_COLUMNS}
+V8_HBV_DNA_NORMALIZED = {normalize_name(x) for x in V8_HBV_DNA_COLUMNS}
+V8_SURGERY_NORMALIZED = {normalize_name(x) for x in V8_SURGERY_COLUMNS}
+
+if V8_CONTINUOUS_NORMALIZED & V8_CATEGORICAL_NORMALIZED:
+    raise RuntimeError("V8 variable-role schema contains overlapping columns")
+if len(V8_CONTINUOUS_NORMALIZED) + len(V8_CATEGORICAL_NORMALIZED) != 56:
+    raise RuntimeError("V8 variable-role schema must contain exactly 56 predictors")
+
+
+@contextlib.contextmanager
+def gpu_slot(cfg: WorkerConfig, label: str):
+    """Cross-process GPU admission control using Linux file locks.
+
+    CPU work continues in parallel, while only ``gpu_concurrency`` GPU-heavy
+    fits may execute at once.  This prevents four simultaneously spawned
+    TabPFN/TabNet jobs from exhausting a 24-GB card.
+    """
+    if (
+        cfg.gpu_concurrency <= 0
+        or fcntl is None
+        or not TORCH_AVAILABLE
+        or not torch.cuda.is_available()
+    ):
+        yield
+        return
+
+    lock_dir = ensure_dir(cfg.gpu_lock_dir)
+    handles = []
+    acquired = None
+    try:
+        while acquired is None:
+            for slot in range(cfg.gpu_concurrency):
+                path = lock_dir / f"gpu_slot_{slot}.lock"
+                handle = open(path, "a+", encoding="utf-8")
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    handle.close()
+                    continue
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"pid={os.getpid()} label={label} time={time.time()}\n")
+                handle.flush()
+                acquired = handle
+                break
+            if acquired is None:
+                time.sleep(0.5)
+        yield
+    finally:
+        if acquired is not None:
+            try:
+                fcntl.flock(acquired.fileno(), fcntl.LOCK_UN)
+            finally:
+                acquired.close()
 
 
 def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -474,7 +586,8 @@ def parse_boundary_number(text: str) -> Optional[float]:
     if not m:
         return None
     try:
-        return float(m.group(1))
+        value = float(m.group(1))
+        return value if np.isfinite(value) else None
     except Exception:
         return None
 
@@ -483,24 +596,114 @@ def parse_tumor_size_max(value: Any) -> float:
     if pd.isna(value):
         return np.nan
     if isinstance(value, (int, float, np.integer, np.floating)):
-        return float(value)
+        number = float(value)
+        return number if np.isfinite(number) else np.nan
     s = str(value).strip()
     if normalize_name(s) in MISSING_TOKENS:
         return np.nan
     if re.search(r"\d,\d", s):
         raise ValueError(f"Tumor size 中仍存在小数逗号: {s}")
     s = s.replace("×", "*").replace("X", "*").replace("x", "*")
+    # A hyphen between two digits is interpreted as a range separator rather
+    # than a negative sign, e.g. 3-5 cm -> 3 and 5.
+    s = re.sub(r"(?<=\d)-(?=\d)", "*", s)
     nums = re.findall(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?", s)
     if not nums:
         return np.nan
     try:
         vals = [float(x) for x in nums]
-        return float(max(vals))
+        vals = [x for x in vals if np.isfinite(x)]
+        return float(max(vals)) if vals else np.nan
     except Exception:
         return np.nan
 
 
+def clean_numeric_value(value: Any) -> float:
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        number = float(value)
+        return number if np.isfinite(number) else np.nan
+    s = str(value).strip()
+    if normalize_name(s) in MISSING_TOKENS:
+        return np.nan
+    parsed = parse_boundary_number(s)
+    return float(parsed) if parsed is not None else np.nan
+
+
+def parse_hbv_dna_value(value: Any) -> float:
+    """Conservatively parse the V8 HBV-DNA column.
+
+    Detection-limit values retain their boundary. RNA-only entries are not
+    HBV-DNA and become missing. In a mixed DNA/RNA entry only the explicit DNA
+    measurement is retained. Malformed notation is not guessed.
+    """
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        number = float(value)
+        return number if np.isfinite(number) else np.nan
+    s = str(value).strip()
+    if normalize_name(s) in MISSING_TOKENS:
+        return np.nan
+    normalized = (
+        s.replace("＜", "<").replace("〉", ">").replace("〈", "<").replace("＞", ">")
+         .replace("≤", "<").replace("≥", ">")
+    )
+    dna_match = re.search(
+        r"(?i)DNA\s*([<>]?\s*[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)",
+        normalized,
+    )
+    if dna_match:
+        return clean_numeric_value(dna_match.group(1))
+    if re.search(r"(?i)RNA", normalized):
+        return np.nan
+    return clean_numeric_value(normalized)
+
+
+def clean_treatment_value(value: Any) -> float:
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating, bool)):
+        number = float(value)
+        if not np.isfinite(number):
+            return np.nan
+        if number in (0.0, 1.0):
+            return number
+        raise ValueError(f"治疗变量出现非0/1数值: {value}")
+    s = str(value).strip()
+    key = normalize_name(s)
+    if key in MISSING_TOKENS:
+        return np.nan
+    if key in {normalize_name(x) for x in NO_TOKENS}:
+        return 0.0
+    if key in {normalize_name(x) for x in YES_TOKENS}:
+        return 1.0
+    # In the locked V8 treatment columns, remaining non-empty strings are
+    # named agents or regimens and therefore denote treatment received.
+    return 1.0
+
+
+def clean_surgery_value(value: Any) -> Any:
+    if pd.isna(value):
+        return np.nan
+    compact = re.sub(r"\s+", "", str(value).strip())
+    mapping = {
+        "开腹": "开腹",
+        "腹腔镜": "腹腔镜",
+        "腹腔镜腹腔镜": "腹腔镜",
+        "荧光腹腔镜": "腹腔镜",
+        "腹腔镜中转": "腹腔镜中转",
+        "腹腔镜开腹": "腹腔镜中转",
+    }
+    if compact not in mapping:
+        raise ValueError(f"术式出现未预设取值: {value}")
+    return mapping[compact]
+
+
 def clean_generic_value(value: Any, treatment: bool = False) -> Any:
+    if treatment:
+        return clean_treatment_value(value)
     if pd.isna(value):
         return np.nan
     if isinstance(value, (int, float, np.integer, np.floating, bool)):
@@ -509,47 +712,179 @@ def clean_generic_value(value: Any, treatment: bool = False) -> Any:
     key = normalize_name(s)
     if key in MISSING_TOKENS:
         return np.nan
-    if treatment:
-        if key in {normalize_name(x) for x in NO_TOKENS}:
-            return 0
-        if key in {normalize_name(x) for x in YES_TOKENS}:
-            return 1
-        # A named drug or explicit regimen denotes treatment received.
-        return 1
     boundary = parse_boundary_number(s)
     if boundary is not None:
         return boundary
     return s
 
 
-def clean_input_dataframe(df: pd.DataFrame, tumor_size_col: str, protected_cols: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def clean_input_dataframe(
+    df: pd.DataFrame,
+    tumor_size_col: str,
+    protected_cols: Sequence[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     out = df.copy()
     audit_rows: List[Dict[str, Any]] = []
     for col in out.columns:
-        if col == tumor_size_col:
-            before_missing = int(out[col].isna().sum())
-            out[col] = out[col].map(parse_tumor_size_max)
-            after_missing = int(out[col].isna().sum())
-            audit_rows.append({
-                "column": col,
-                "cleaning": "tumor_size_largest_diameter",
-                "missing_before": before_missing,
-                "missing_after": after_missing,
-            })
-            continue
         if col in protected_cols:
             continue
-        treatment = is_treatment_column(col)
         before_missing = int(out[col].isna().sum())
-        out[col] = out[col].map(lambda v, t=treatment: clean_generic_value(v, treatment=t))
+        norm_col = normalize_name(col)
+        if col == tumor_size_col:
+            out[col] = out[col].map(parse_tumor_size_max)
+            cleaning = "tumor_size_largest_diameter"
+        elif norm_col in V8_HBV_DNA_NORMALIZED:
+            out[col] = out[col].map(parse_hbv_dna_value)
+            cleaning = "hbv_dna_numeric_or_missing"
+        elif norm_col in V8_SURGERY_NORMALIZED:
+            out[col] = out[col].map(clean_surgery_value)
+            cleaning = "surgery_normalized"
+        elif norm_col in V8_TREATMENT_NORMALIZED:
+            out[col] = out[col].map(clean_treatment_value)
+            cleaning = "treatment_binary"
+        elif norm_col in V8_CONTINUOUS_NORMALIZED:
+            out[col] = out[col].map(clean_numeric_value)
+            cleaning = "continuous_numeric_or_missing"
+        else:
+            out[col] = out[col].map(clean_generic_value)
+            cleaning = "categorical_deterministic"
         after_missing = int(out[col].isna().sum())
         audit_rows.append({
             "column": col,
-            "cleaning": "treatment_binary" if treatment else "generic_deterministic",
+            "cleaning": cleaning,
             "missing_before": before_missing,
             "missing_after": after_missing,
+            "new_missing": after_missing - before_missing,
         })
     return out, pd.DataFrame(audit_rows)
+
+
+def recompute_v8_derived_indicators(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Recompute deterministic binary indicators from their cleaned sources.
+
+    The original and recomputed values are recorded so the correction is fully
+    traceable.  Source-missing rows retain the cleaned original indicator.
+    """
+    out = df.copy()
+    rules = [
+        ("术前AFP (ng/ml)", "AFP＞400", lambda x: int(x > 400)),
+        ("肿瘤大小(CM)", "肿瘤长径大于5cm", lambda x: int(x > 5)),
+        ("切缘", "切缘小于等于1cm", lambda x: int(x <= 1)),
+        ("MVI分级", "MVI（YES 1,NO 0）", lambda x: int(x > 0)),
+        ("TB数量", "TB（YES 1,NO 0）", lambda x: int(x > 0)),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for source, derived, fn in rules:
+        if source not in out.columns or derived not in out.columns:
+            continue
+        source_values = pd.to_numeric(out[source], errors="coerce")
+        original = pd.to_numeric(out[derived], errors="coerce")
+        recomputed = original.copy()
+        source_mask = source_values.notna()
+        recomputed.loc[source_mask] = source_values.loc[source_mask].map(fn)
+        mismatch = source_mask & original.notna() & (original != recomputed)
+        for idx in out.index[mismatch]:
+            rows.append({
+                "sample_index": serializable_index(idx),
+                "source_column": source,
+                "source_value": source_values.loc[idx],
+                "derived_column": derived,
+                "original_derived_value": original.loc[idx],
+                "recomputed_derived_value": recomputed.loc[idx],
+            })
+        out[derived] = recomputed
+    return out, pd.DataFrame(rows)
+
+
+def validate_v8_cleaned_schema(
+    df: pd.DataFrame,
+    feature_columns: Sequence[str],
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for col in feature_columns:
+        norm_col = normalize_name(col)
+        if norm_col in V8_CONTINUOUS_NORMALIZED:
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            bad = df[col].notna() & numeric.isna()
+            if bad.any():
+                examples = df.loc[bad, col].astype(str).head(10).tolist()
+                raise ValueError(f"连续变量 {col} 清洗后仍含非数值: {examples}")
+            finite = numeric.dropna().map(np.isfinite)
+            if not finite.all():
+                raise ValueError(f"连续变量 {col} 清洗后仍含非有限值")
+            role = "continuous"
+            unique_n = int(numeric.dropna().nunique())
+        elif norm_col in V8_CATEGORICAL_NORMALIZED:
+            role = "categorical"
+            unique_n = int(df[col].dropna().astype(str).nunique())
+        else:
+            raise ValueError(f"特征未包含在锁定的V8变量类型清单中: {col}")
+        rows.append({
+            "column": col,
+            "prespecified_type": role,
+            "non_missing": int(df[col].notna().sum()),
+            "missing": int(df[col].isna().sum()),
+            "observed_unique_values": unique_n,
+        })
+
+    for col in feature_columns:
+        if normalize_name(col) in V8_TREATMENT_NORMALIZED:
+            observed = set(pd.to_numeric(df[col], errors="coerce").dropna().astype(int).unique())
+            if not observed.issubset({0, 1}):
+                raise ValueError(f"治疗变量 {col} 清洗后不是0/1: {sorted(observed)}")
+    return pd.DataFrame(rows)
+
+
+def build_v8_manual_review_audit(
+    df: pd.DataFrame,
+    id_col: str,
+    save_direct_identifiers: bool = False,
+) -> pd.DataFrame:
+    """Flag values that should be verified against the source record.
+
+    These are not silently corrected because doing so would require a clinical
+    assumption or unit conversion not contained in the input workbook.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    def add_mask(column: str, mask: pd.Series, severity: str, reason: str) -> None:
+        if column not in df.columns:
+            return
+        for idx in df.index[mask.fillna(False)]:
+            row: Dict[str, Any] = {
+                "severity": severity,
+                "sample_index": serializable_index(idx),
+                "column": column,
+                "value": df.loc[idx, column],
+                "reason": reason,
+            }
+            if save_direct_identifiers:
+                row["sample_id"] = df.loc[idx, id_col]
+            rows.append(row)
+
+    if "血小板" in df.columns:
+        x = pd.to_numeric(df["血小板"], errors="coerce")
+        add_mask("血小板", x.notna() & ((x < 10) | (x > 1000)), "critical", "possible unit or decimal-place inconsistency")
+    if "肿瘤大小(CM)" in df.columns:
+        x = pd.to_numeric(df["肿瘤大小(CM)"], errors="coerce")
+        add_mask("肿瘤大小(CM)", x.notna() & (x > 30), "critical", "extreme maximum diameter; verify the original dimensional string")
+    if "年龄（岁）" in df.columns:
+        x = pd.to_numeric(df["年龄（岁）"], errors="coerce")
+        add_mask("年龄（岁）", x.notna() & ((x < 18) | (x > 100)), "warning", "unusual age for the study population")
+    if "术前总胆红素（umol/L）" in df.columns:
+        x = pd.to_numeric(df["术前总胆红素（umol/L）"], errors="coerce")
+        add_mask("术前总胆红素（umol/L）", x.notna() & (x < 1), "warning", "possible unit inconsistency; verify source value")
+
+    stage_rules = [
+        ("child-pugh分级（1=A，2=B）", 2, "column label documents only 1-2; verify whether 3 denotes class C"),
+        ("CNLC分期（1=Ia，2=Ib，3=IIa,4=IIb，5=IIIa，6=IIIb）", 6, "column label documents only 1-6; verify coding of higher values"),
+        ("BCLC分期（0=0期，1=A，2=B,3=C,4=D）", 4, "column label documents only 0-4; verify coding of higher values"),
+    ]
+    for col, upper, reason in stage_rules:
+        if col in df.columns:
+            x = pd.to_numeric(df[col], errors="coerce")
+            add_mask(col, x.notna() & (x > upper), "warning", reason)
+    return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
@@ -781,17 +1116,21 @@ class FoldPreprocessor:
         return bool(len(s) and np.all(np.isclose(s, np.round(s))))
 
     def _identify_types(self, df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-        categorical, continuous = [], []
+        categorical: List[str] = []
+        continuous: List[str] = []
+        unknown: List[str] = []
         for col in df.columns:
-            s = df[col]
-            if pd.api.types.is_object_dtype(s) or pd.api.types.is_categorical_dtype(s) or pd.api.types.is_bool_dtype(s):
+            norm_col = normalize_name(col)
+            if norm_col in V8_CATEGORICAL_NORMALIZED:
                 categorical.append(col)
+            elif norm_col in V8_CONTINUOUS_NORMALIZED:
+                continuous.append(col)
             else:
-                numeric = pd.to_numeric(s, errors="coerce")
-                if numeric.dropna().nunique() <= self.categorical_unique_threshold and self._integer_like(numeric):
-                    categorical.append(col)
-                else:
-                    continuous.append(col)
+                unknown.append(col)
+        if unknown:
+            raise ValueError(
+                "以下模型特征未包含在锁定的V8变量类型清单中: " + ", ".join(unknown)
+            )
         return categorical, continuous
 
     def _fit_category_maps(self, df: pd.DataFrame) -> None:
@@ -867,6 +1206,7 @@ class FoldPreprocessor:
             "log1p_cols": self.log1p_cols_,
             "dropped_all_nan_cols": self.all_nan_cols_,
             "knn_neighbors": KNN_IMPUTER_K,
+            "variable_type_source": "prespecified_locked_V8_schema",
         }
 
 
@@ -1261,8 +1601,11 @@ def load_clean_data_for_worker(cfg: WorkerConfig) -> pd.DataFrame:
     tumor_col = cfg.feature_sets["classic_preop"][-1]
     protected = [cfg.id_col, cfg.time_col] + [t for t in ALL_TARGETS if t in df.columns]
     cleaned, _ = clean_input_dataframe(df, tumor_size_col=tumor_col, protected_cols=protected)
+    cleaned, _ = recompute_v8_derived_indicators(cleaned)
     cleaned[cfg.id_col] = cleaned[cfg.id_col].map(normalize_id)
     cleaned[cfg.time_col] = pd.to_datetime(cleaned[cfg.time_col], errors="coerce")
+    all_features = list(dict.fromkeys(sum(cfg.feature_sets.values(), [])))
+    validate_v8_cleaned_schema(cleaned, all_features)
     return cleaned
 
 
@@ -1301,10 +1644,14 @@ def run_cv_feature_set_worker(feature_set: str, cfg_dict: Dict[str, Any]) -> Dic
     worker_log = cv_root / f"worker_{feature_set}.log"
     log_line(f"CV worker started: {feature_set} ({FEATURE_SET_DISPLAY[feature_set]})", worker_log)
     fs_cols = cfg.feature_sets[feature_set]
-    run_models = [m for m in cfg.models if m in CORE_MODELS]
-    # Stage baselines are run only in the ICPI worker, once per target.
+    # Run CPU models first so that temporal GPU work can overlap with CV CPU
+    # work. GPU-heavy models are admitted through the cross-process GPU slots.
+    cpu_order = ["XGBoost", "LightGBM", "RandomForest"]
+    gpu_order = ["TabPFN", "TabNet"]
+    run_models = [m for m in cpu_order if m in cfg.models]
     if feature_set == "full_data":
-        run_models += [m for m in cfg.models if m in STAGE_MODELS]
+        run_models += [m for m in STAGE_MODELS if m in cfg.models]
+    run_models += [m for m in gpu_order if m in cfg.models]
 
     result_rows: List[Dict[str, Any]] = []
     pred_rows: List[pd.DataFrame] = []
@@ -1360,13 +1707,28 @@ def run_cv_feature_set_worker(feature_set: str, cfg_dict: Dict[str, Any]) -> Dic
                     y_train = y.loc[train_idx].to_numpy(dtype=int)
                     y_val = y.loc[val_idx].to_numpy(dtype=int)
                     y_test = y.loc[test_idx].to_numpy(dtype=int)
-                    model = make_model(model_name, "cv", cfg)
-                    model.fit(X_train, y_train, X_val, y_val)
-                    val_prob = model.predict_proba_1(X_val)
-                    threshold, roc_df = compute_youden_threshold(y_val, val_prob)
-                    test_prob = model.predict_proba_1(X_test)
-                    metrics = compute_metrics(y_test, test_prob, threshold)
                     fold_dir = ensure_dir(model_dir / "folds" / f"fold_{fold}")
+                    model = None
+                    lock_context = (
+                        gpu_slot(cfg, f"cv|{feature_set}|{target}|{model_name}|fold={fold}")
+                        if model_name in GPU_MODELS else contextlib.nullcontext()
+                    )
+                    with lock_context:
+                        model = make_model(model_name, "cv", cfg)
+                        model.fit(X_train, y_train, X_val, y_val)
+                        val_prob = model.predict_proba_1(X_val)
+                        threshold, roc_df = compute_youden_threshold(y_val, val_prob)
+                        test_prob = model.predict_proba_1(X_test)
+                        metrics = compute_metrics(y_test, test_prob, threshold)
+                        if model_name == "TabPFN" and fold == 1 and cfg.run_shap:
+                            run_generic_shap(
+                                model, X_train, X_test, fold_dir / "shap",
+                                cfg.shap_background, cfg.shap_test,
+                            )
+                        if model_name in GPU_MODELS:
+                            del model
+                            model = None
+                            release_worker_memory()
                     if not roc_df.empty:
                         roc_df.to_csv(fold_dir / "val_roc_curve.csv", index=False, encoding="utf-8-sig")
                     pred = pd.DataFrame({
@@ -1393,14 +1755,18 @@ def run_cv_feature_set_worker(feature_set: str, cfg_dict: Dict[str, Any]) -> Dic
                         TN=metrics["TN"], FP=metrics["FP"], FN=metrics["FN"], TP=metrics["TP"],
                     )
                     model_fold_results.append(row)
-                    if model_name == "TabPFN" and fold == 1 and cfg.run_shap:
-                        run_generic_shap(model, X_train, X_test, fold_dir / "shap", cfg.shap_background, cfg.shap_test)
                 except Exception as exc:
                     err = f"{type(exc).__name__}: {exc}"
                     error_dir = ensure_dir(model_dir / "folds" / f"fold_{fold}")
                     (error_dir / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
                     log_line(f"ERROR | CV | {feature_set} | {target} | {model_name} | fold {fold}: {err}", worker_log)
                     model_fold_results.append(empty_model_result("cv", target, feature_set, model_name, "error", err, fold=fold, n_samples=len(task), n_train=len(train_idx), n_val=len(val_idx), n_test=len(test_idx), n_features=len(fs_cols)))
+                finally:
+                    try:
+                        del model
+                    except Exception:
+                        pass
+                    release_worker_memory()
 
             for r in model_fold_results:
                 result_rows.append(asdict(r))
@@ -1949,9 +2315,12 @@ def run_temporal_primary_model(
                     f"epochs={TEMPORAL_TABNET_MAX_EPOCHS}",
                     log_file,
                 )
-                member = TemporalTabNetModel(seed)
-                member.fit(X_train, y_train)
-                member_prob = np.asarray(member.predict_proba_1(X_test), dtype=float)
+                with gpu_slot(cfg, f"temporal|{target}|{feature_set}|TabNet|seed={seed}"):
+                    member = TemporalTabNetModel(seed)
+                    member.fit(X_train, y_train)
+                    member_prob = np.asarray(member.predict_proba_1(X_test), dtype=float)
+                    del member
+                    release_worker_memory()
                 member_probabilities.append(member_prob)
                 member_metrics = compute_metrics(y_test, member_prob, TEMPORAL_FIXED_THRESHOLD)
                 member_metric_rows.append({
@@ -1976,8 +2345,6 @@ def run_temporal_primary_model(
                     "y_true": y_test,
                     "y_prob": member_prob,
                 }))
-                del member
-                release_worker_memory()
             test_prob = np.mean(np.vstack(member_probabilities), axis=0)
             member_metrics_df = pd.DataFrame(member_metric_rows)
             member_predictions_df = pd.concat(member_prediction_frames, ignore_index=True)
@@ -1997,9 +2364,19 @@ def run_temporal_primary_model(
             seed_specification = "42-61 probability mean ensemble"
             ensemble_members = len(TEMPORAL_TABNET_SEEDS)
         else:
-            model = make_temporal_model(model_name, RANDOM_STATE, cfg)
-            model.fit(X_train, y_train)
-            test_prob = np.asarray(model.predict_proba_1(X_test), dtype=float)
+            model = None
+            lock_context = (
+                gpu_slot(cfg, f"temporal|{target}|{feature_set}|{model_name}")
+                if model_name in GPU_MODELS else contextlib.nullcontext()
+            )
+            with lock_context:
+                model = make_temporal_model(model_name, RANDOM_STATE, cfg)
+                model.fit(X_train, y_train)
+                test_prob = np.asarray(model.predict_proba_1(X_test), dtype=float)
+                if model_name in GPU_MODELS:
+                    del model
+                    model = None
+                    release_worker_memory()
             fixed_epochs_or_estimators = {
                 "XGBoost": 400.0,
                 "LightGBM": 400.0,
@@ -2093,9 +2470,19 @@ def run_temporal_primary_model(
             model_dir / "run_meta.json",
         )
         extras["dca"] = dca
+        try:
+            del model
+        except Exception:
+            pass
+        release_worker_memory()
         return result, predictions, curves, bootstrap, extras
 
     except Exception as exc:
+        try:
+            del model
+        except Exception:
+            pass
+        release_worker_memory()
         error_message = f"{type(exc).__name__}: {exc}"
         (model_dir / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
         log_line(
@@ -2501,6 +2888,27 @@ def run_temporal_validation(
     }
 
 
+def run_temporal_worker(
+    cfg_dict: Dict[str, Any],
+    temporal_bootstrap_rounds: int,
+    paired_bootstrap_rounds: int,
+    save_direct_identifiers: bool,
+) -> Dict[str, Any]:
+    cfg = WorkerConfig(**cfg_dict)
+    df = load_clean_data_for_worker(cfg)
+    tables = run_temporal_validation(
+        df,
+        cfg,
+        temporal_bootstrap_rounds=temporal_bootstrap_rounds,
+        paired_bootstrap_rounds=paired_bootstrap_rounds,
+        save_direct_identifiers=save_direct_identifiers,
+    )
+    return {
+        "status": "completed",
+        "result_rows": int(len(tables.get("results", pd.DataFrame()))),
+    }
+
+
 # -----------------------------------------------------------------------------
 # Phase orchestration and summaries
 # -----------------------------------------------------------------------------
@@ -2769,7 +3177,36 @@ def _sanitized_command_line(args: argparse.Namespace) -> str:
     parts.extend(["--sheet", str(args.sheet), "--time-col", str(args.time_col)])
     if args.id_col:
         parts.extend(["--id-col", str(args.id_col)])
+    scalar_options = {
+        "--feature-set-workers": args.feature_set_workers,
+        "--model-n-jobs": args.model_n_jobs,
+        "--temporal-model-n-jobs": args.temporal_model_n_jobs,
+        "--gpu-concurrency": args.gpu_concurrency,
+        "--bootstrap-rounds": args.bootstrap_rounds,
+        "--temporal-bootstrap-rounds": args.temporal_bootstrap_rounds,
+        "--paired-bootstrap-rounds": args.paired_bootstrap_rounds,
+        "--shap-background": args.shap_background,
+        "--shap-test": args.shap_test,
+        "--gpu-monitor-interval": args.gpu_monitor_interval,
+        "--minimum-free-gb": args.minimum_free_gb,
+    }
+    for option, value in scalar_options.items():
+        parts.extend([option, str(value)])
     parts.extend(["--models", *map(str, args.models)])
+    flag_options = {
+        "--parallel-cv-temporal": args.parallel_cv_temporal,
+        "--allow-data-warnings": args.allow_data_warnings,
+        "--skip-shap": args.skip_shap,
+        "--save-fold-data": args.save_fold_data,
+        "--allow-low-disk": args.allow_low_disk,
+        "--overwrite": args.overwrite,
+        "--preflight-only": args.preflight_only,
+        "--save-direct-identifiers": args.save_direct_identifiers,
+        "--record-absolute-paths": args.record_absolute_paths,
+    }
+    for option, enabled in flag_options.items():
+        if enabled:
+            parts.append(option)
     return " ".join(parts)
 
 
@@ -2780,6 +3217,12 @@ def save_reproducibility(output_root: Path, args: argparse.Namespace, feature_se
         params[key] = _metadata_path(params.get(key, ""), args.record_absolute_paths)
     params["feature_sets"] = feature_sets
     params["expected_feature_counts"] = EXPECTED_FEATURE_COUNTS
+    params["v8_variable_role_schema"] = {
+        "continuous": sorted(V8_CONTINUOUS_COLUMNS),
+        "categorical": sorted(V8_CATEGORICAL_COLUMNS),
+        "treatment_binary": sorted(V8_TREATMENT_COLUMNS),
+        "source": "prespecified locked V8 schema",
+    }
     params["temporal_design"] = {
         "protocol": "full-development interval-gap fixed protocol",
         "split_name": TEMPORAL_SPLIT_NAME,
@@ -2974,10 +3417,24 @@ def preflight(args: argparse.Namespace, output_root: Path) -> Tuple[pd.DataFrame
         raise ValueError(f"检测到残余小数逗号，已停止。示例: {comma_hits[:5]}")
     tumor_col = feature_sets["classic_preop"][-1]
     cleaned, cleaning_audit = clean_input_dataframe(df, tumor_col, [id_col, args.time_col] + ALL_TARGETS)
+    cleaned, derived_audit = recompute_v8_derived_indicators(cleaned)
     cleaned[id_col] = cleaned[id_col].map(normalize_id)
     cleaned[args.time_col] = dates
+    all_feature_columns = list(dict.fromkeys(sum(feature_sets.values(), [])))
+    type_audit = validate_v8_cleaned_schema(cleaned, all_feature_columns)
+    manual_review = build_v8_manual_review_audit(cleaned, id_col, args.save_direct_identifiers)
     feature_audit.to_csv(output_root / "preflight_feature_set_audit.csv", index=False, encoding="utf-8-sig")
     cleaning_audit.to_csv(output_root / "preflight_cleaning_audit.csv", index=False, encoding="utf-8-sig")
+    derived_audit.to_csv(output_root / "preflight_derived_indicator_audit.csv", index=False, encoding="utf-8-sig")
+    type_audit.to_csv(output_root / "preflight_variable_type_audit.csv", index=False, encoding="utf-8-sig")
+    manual_review.to_csv(output_root / "preflight_manual_review.csv", index=False, encoding="utf-8-sig")
+    if not manual_review.empty:
+        critical = manual_review[manual_review["severity"] == "critical"]
+        if not critical.empty and not args.allow_data_warnings:
+            raise ValueError(
+                "V8中存在需要人工核对的关键数据值。请查看 preflight_manual_review.csv；"
+                "核对并修正原始数据后重新运行。若已核对且确认原值无误，可显式使用 --allow-data-warnings。"
+            )
     # Strict fold compatibility for every endpoint before workers are started.
     fold_long = read_fold_long(fold)
     fold_audit = []
@@ -3016,6 +3473,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-set-workers", type=int, default=3)
     parser.add_argument("--model-n-jobs", type=int, default=2, help="Threads per model during internal CV")
     parser.add_argument("--temporal-model-n-jobs", type=int, default=1, help="Threads per tree model during S3 temporal validation")
+    parser.add_argument("--parallel-cv-temporal", action="store_true", help="Run the three CV feature-set workers and the temporal phase concurrently")
+    parser.add_argument("--gpu-concurrency", type=int, default=1, help="Maximum simultaneous TabPFN/TabNet fits across all processes; use 1 for a 24-GB GPU unless a smoke test confirms 2 is safe")
+    parser.add_argument("--allow-data-warnings", action="store_true", help="Proceed despite critical rows in preflight_manual_review.csv only after source-record verification")
     parser.add_argument("--bootstrap-rounds", type=int, default=DEFAULT_BOOTSTRAP_ROUNDS, help="Internal CV bootstrap rounds")
     parser.add_argument("--temporal-bootstrap-rounds", type=int, default=DEFAULT_TEMPORAL_BOOTSTRAP_ROUNDS, help="Temporal validation bootstrap confidence-interval rounds")
     parser.add_argument("--paired-bootstrap-rounds", type=int, default=DEFAULT_PAIRED_BOOTSTRAP_ROUNDS, help="Temporal paired AUROC bootstrap rounds versus TabPFN")
@@ -3043,6 +3503,8 @@ def main() -> None:
         raise ValueError("--model-n-jobs 必须 >=1")
     if args.temporal_model_n_jobs < 1:
         raise ValueError("--temporal-model-n-jobs 必须 >=1")
+    if args.gpu_concurrency < 1:
+        raise ValueError("--gpu-concurrency 必须 >=1")
     output_root = Path(args.output).resolve()
     check_disk_space(output_root, args.minimum_free_gb, args.allow_low_disk)
     prepare_output_root(output_root, args.overwrite)
@@ -3070,6 +3532,8 @@ def main() -> None:
         model_n_jobs=args.model_n_jobs,
         temporal_model_n_jobs=args.temporal_model_n_jobs,
         bootstrap_rounds=args.bootstrap_rounds,
+        gpu_concurrency=args.gpu_concurrency,
+        gpu_lock_dir=str(output_root / "reproducibility" / "gpu_slots"),
         run_shap=not args.skip_shap, shap_background=args.shap_background,
         shap_test=args.shap_test, save_fold_data=args.save_fold_data,
         save_direct_identifiers=args.save_direct_identifiers,
@@ -3079,21 +3543,34 @@ def main() -> None:
     monitor.start()
     try:
         context = mp.get_context("spawn")
-        # Internal CV retains the original three feature-set workers.
-        with ProcessPoolExecutor(max_workers=args.feature_set_workers, mp_context=context) as executor:
-            run_phase_in_executor(executor, run_cv_feature_set_worker, "internal CV", cfg)
+        if args.parallel_cv_temporal:
+            log_line(
+                "Parallel schedule enabled: 3 CV feature-set workers + 1 temporal worker; "
+                f"GPU concurrency={args.gpu_concurrency}",
+                output_root / "master.log",
+            )
+            with ProcessPoolExecutor(max_workers=4, mp_context=context) as executor:
+                temporal_future = executor.submit(
+                    run_temporal_worker,
+                    asdict(cfg),
+                    args.temporal_bootstrap_rounds,
+                    args.paired_bootstrap_rounds,
+                    args.save_direct_identifiers,
+                )
+                run_phase_in_executor(executor, run_cv_feature_set_worker, "internal CV", cfg)
+                temporal_result = temporal_future.result()
+                log_line(f"Temporal worker result: {temporal_result}", output_root / "master.log")
+        else:
+            with ProcessPoolExecutor(max_workers=args.feature_set_workers, mp_context=context) as executor:
+                run_phase_in_executor(executor, run_cv_feature_set_worker, "internal CV", cfg)
+            run_temporal_validation(
+                cleaned_df,
+                cfg,
+                temporal_bootstrap_rounds=args.temporal_bootstrap_rounds,
+                paired_bootstrap_rounds=args.paired_bootstrap_rounds,
+                save_direct_identifiers=args.save_direct_identifiers,
+            )
         cv_summary = summarize_cv(output_root)
-
-        # Temporal validation is intentionally sequential: every model is trained once on
-        # the complete development period, and TabNet members are averaged without
-        # validation-based seed, epoch or threshold selection.
-        run_temporal_validation(
-            cleaned_df,
-            cfg,
-            temporal_bootstrap_rounds=args.temporal_bootstrap_rounds,
-            paired_bootstrap_rounds=args.paired_bootstrap_rounds,
-            save_direct_identifiers=args.save_direct_identifiers,
-        )
         temporal_summary = summarize_temporal(output_root)
         shap_long = aggregate_shap(output_root / "cv", output_root / "summary")
         export_source_data(output_root, cv_summary, temporal_summary, shap_long, feature_sets)

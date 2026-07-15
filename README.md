@@ -11,7 +11,10 @@ The workflow includes:
 - comparisons among TabPFN, TabNet, XGBoost, LightGBM, Random Forest, CNLC, and BCLC;
 - the sole prespecified S3 3-month interval-gap temporal validation;
 - bootstrap confidence intervals, calibration assessment, decision-curve analysis,
-  paired AUROC comparisons, and optional SHAP analysis.
+  paired AUROC comparisons, and optional SHAP analysis;
+- a locked V8 variable-role schema, deterministic source-value cleaning,
+  derived-indicator reconciliation, and auditable data-quality checks;
+- optional concurrent CV and temporal execution with process-level GPU admission control.
 
 Patient-level data, fixed-fold assignments, model checkpoints, and generated
 results are not included because they may contain sensitive or
@@ -44,6 +47,30 @@ generates replacement folds.
 
 Continuous tumour size is represented by the largest recorded diameter.
 The binary indicator `Tumor Size >5 cm` is included only in ICPI.
+
+### Audited V8 preprocessing
+
+The public program locks the 56 V8 predictors to 31 continuous and 25
+categorical roles rather than inferring variable type separately within each
+fold. This prevents continuous laboratory measurements containing occasional
+source strings from being interpreted as high-cardinality categorical
+variables.
+
+Before split-local preprocessing, the program:
+
+- converts prespecified continuous variables to finite numeric values or missing;
+- parses HBV-DNA conservatively and does not substitute RNA-only measurements;
+- normalises the prespecified surgical-approach categories;
+- converts prespecified treatment variables to binary values;
+- represents multidimensional tumour size by the largest recorded diameter;
+- reconciles deterministic indicators for AFP >400, tumour size >5 cm,
+  margin <=1 cm, MVI presence, and tumour budding presence;
+- exports cleaning, variable-role, derived-indicator, and manual-review audits.
+
+Critical source-value flags stop execution by default. `--allow-data-warnings`
+should be used only after the flagged values have been checked against the
+source record. Direct patient identifiers remain excluded from audit outputs
+unless `--save-direct-identifiers` is explicitly enabled.
 
 ### Prespecified S3 interval-gap temporal validation
 
@@ -81,7 +108,8 @@ Provide a private Excel workbook containing:
 
 The program performs strict checks before model fitting. Unexpected feature
 counts, duplicated columns, missing endpoints, incompatible fixed folds,
-invalid dates, and residual decimal commas cause an explicit failure.
+invalid dates, residual decimal commas, unrecognised V8 predictor roles, and
+critical manual-review findings cause an explicit failure.
 
 ### Fixed-fold assignment file
 
@@ -158,7 +186,25 @@ The default thread settings preserve the original component protocols:
 ```text
 --model-n-jobs 2
 --temporal-model-n-jobs 1
+--gpu-concurrency 1
 ```
+
+For a Linux GPU server, CV and temporal phases can be scheduled concurrently:
+
+```bash
+python hcc_postoperative_prognosis_benchmark.py \
+  --excel /path/to/private_analysis_data.xlsx \
+  --fold-file /path/to/fixed_fold_long.csv \
+  --tabpfn-checkpoint /path/to/tabpfn_checkpoint.ckpt \
+  --output outputs/hcc_postoperative_prognosis_benchmark \
+  --parallel-cv-temporal \
+  --gpu-concurrency 1
+```
+
+`--gpu-concurrency 1` is the recommended starting point for a 24-GB GPU. The
+cross-process GPU slot lock uses the Linux `fcntl` facility. On systems without
+`fcntl`, do not enable parallel CV/temporal execution unless GPU memory safety
+has been established independently.
 
 Display all command-line options:
 
@@ -195,6 +241,8 @@ outputs/hcc_postoperative_prognosis_benchmark/
 
 Major subdirectories include:
 
+- root-level `preflight_*.csv` files: feature-set, cleaning, variable-role,
+  derived-indicator, fixed-fold, and manual-review audits;
 - `cv/`: fold-level and pooled internal cross-validation results;
 - `temporal/`: the sole prespecified S3 full-development interval-gap temporal validation results;
 - `summary/`: consolidated result tables and source-data workbooks;
@@ -211,6 +259,10 @@ Major subdirectories include:
 - S3 temporal preprocessing is fitted once on the complete 2015-10-05 to 2019-06-30 development set.
 - Direct identifiers are used internally only to validate alignment with the
   prespecified fold file unless explicitly exported.
+- The locked V8 variable-role schema and all execution-relevant CLI settings
+  are recorded in the reproducibility metadata.
+- Optional parallel scheduling changes execution order only; model definitions,
+  folds, preprocessing boundaries, seeds, and evaluation procedures are unchanged.
 
 ## Data availability
 
