@@ -1,0 +1,101 @@
+{
+  "release": "CGH_TTR_AUDITED_20260818",
+  "endpoint_semantics": "OS + recurrence-only TTR fixed-time tasks only",
+  "tabpfn_policy": "STRICT_LOCAL_CHECKPOINT_NO_FALLBACK_V1",
+  "checkpoint_sha256": "5d7170e2d3af01f9c501bb09ec3bd12e9944f8604de18002c647873c6ec04a12",
+  "shap_policy": "five outer held-out folds; patient-level OOF aggregation; background<=60; test cap=0; chunk=8; deterministic per-endpoint/per-feature-set/per-fold SHAP seed",
+  "temporal_split": "S3_gap3m_2019Q4_to_2020",
+  "subset_execution": "--targets/--feature-sets/--partial-cv-only available for reproducibility scheduling",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 82,
+      "sha256": "45689f273af9805bb8638023be287ec7b1b866a5b265c6b4fea86720da66c9d5"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "bytes": 611,
+      "sha256": "544d8c39d30907af53112ef15fb105ae04bd2f09381b3bbee1a772338b85560c"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 248,
+      "sha256": "2f9c92517b06b0fb850d9ae81524c12050132c9eb90cc19fcaa87ba00619bc3e"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "bytes": 1127,
+      "sha256": "6d1e7b49404935146fdc5bd852714bd84ac789d187c5a3c614810eb3042d98c9"
+    },
+    {
+      "path": "ENDPOINT_NAMING_AUDIT.txt",
+      "bytes": 411,
+      "sha256": "57fdce2d0242e3f2ef7635739dcd95f73299556ac88c95a5e69fb1f354dd30bb"
+    },
+    {
+      "path": "GITHUB_UPLOAD_CHECKLIST.md",
+      "bytes": 815,
+      "sha256": "58045b66406d22a051d384b9a963fc352a1726736c435ff692a4c597bd056d64"
+    },
+    {
+      "path": "README.md",
+      "bytes": 8247,
+      "sha256": "62efbc04e0549a5d090ab498edf55a1595295b8970787527ef7d161991f16192"
+    },
+    {
+      "path": "REPRODUCIBILITY.md",
+      "bytes": 2069,
+      "sha256": "22288e4c0ac57c76a3150723776ff10aec776ff2bdb5928e79fd4e2c28e58868"
+    },
+    {
+      "path": "REPRODUCTION_TEST_REPORT.md",
+      "bytes": 4052,
+      "sha256": "2801d735bf48050f679febc15eee6d35a8d2908efcb583b78b3f2614d6d6c4b5"
+    },
+    {
+      "path": "cgh_supplementary_analyses.py",
+      "bytes": 26173,
+      "sha256": "0b551c57bf842c71cbd5e4b4a4d282d903ec1de876353a8a2b376ad1d61793bc"
+    },
+    {
+      "path": "hcc_postoperative_prognosis_benchmark.py",
+      "bytes": 183852,
+      "sha256": "60365e0a3817b1b5fb6ec55101f64708abbc0f761fb1e1d4b662039a8ee7f0f1"
+    },
+    {
+      "path": "requirements-cgh.txt",
+      "bytes": 52,
+      "sha256": "7b409c64bbf1212571f8c7a3caa231fd39c6f4ca0ae89e1a4c0c1d7dd5d778f4"
+    },
+    {
+      "path": "requirements-reproduction.txt",
+      "bytes": 344,
+      "sha256": "f50b45cadf5b57f86c5ce918a3e4b713dc6c19a3cb6b60c986d8e9504b3e5e15"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 328,
+      "sha256": "ea1d83d25175031131d7b96b26c25374188ad637d76fa643132093b9c614b07e"
+    },
+    {
+      "path": "tests/test_cgh_helpers.py",
+      "bytes": 946,
+      "sha256": "8044678282394a2e0157147daba23121b16383ee47d06e77ab21053dcd7f36bd"
+    },
+    {
+      "path": "tests/test_core_contracts.py",
+      "bytes": 1400,
+      "sha256": "46a483e1783dcc9247af0df3e3aedf1e7a9831d4164269f9dad5d96c434f4fcf"
+    },
+    {
+      "path": "tests/test_no_fallback_static.py",
+      "bytes": 1369,
+      "sha256": "b4e14fff84de5f168aa5b22a59d995a11ceaea0b444a83ab27967737af428516"
+    },
+    {
+      "path": "tools/validate_r93_reference_bundle.py",
+      "bytes": 4988,
+      "sha256": "40f032d0e10de8101627eca5738491348d220d6e4ca2308d277678b140e685c2"
+    }
+  ]
+}

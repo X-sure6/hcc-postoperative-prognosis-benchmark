@@ -1,57 +1,51 @@
-# Python caches and environments
+# Python
 __pycache__/
 *.py[cod]
 *.so
+.pytest_cache/
+.mypy_cache/
+
+# Environments
 .venv/
 venv/
 env/
-.env
-.env.*
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.ipynb_checkpoints/
 
-# IDE and operating-system files
-.vscode/
+# IDE / OS
 .idea/
+.vscode/
 .DS_Store
 Thumbs.db
 
-# Private clinical data and fold assignments
-data/
-private_data/
+# Private clinical data
 *.xlsx
 *.xls
-*fold*.csv
-*fold*.tsv
+*.csv
+*.tsv
+*.sav
+*.dta
 
-# Model checkpoints and serialized objects
-checkpoints/
-models/
+# Model weights
 *.ckpt
 *.pt
 *.pth
-*.pkl
-*.pickle
-*.joblib
-*.onnx
+*.bin
 
-# Generated outputs
+# Numerical outputs
+*.npy
+*.npz
+*.pkl
+*.joblib
+
+# Runtime outputs
 outputs/
+output/
 results/
 logs/
 *.log
-*.tmp
-*.bak
 
-# Large intermediate arrays and tables
-*.npy
-*.npz
-*.parquet
-*.feather
-
-# Packaging artifacts
-build/
-dist/
-*.egg-info/
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z

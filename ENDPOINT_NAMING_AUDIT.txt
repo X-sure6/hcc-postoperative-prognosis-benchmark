@@ -1,0 +1,13 @@
+Endpoint naming audit — 2026-08-18
+
+PASS
+
+Active fixed-time endpoints:
+OS12m OS24m OS36m OS48m OS60m
+TTR12m TTR24m TTR36m TTR48m TTR60m
+
+Temporal endpoints:
+OS12m OS24m TTR12m TTR24m
+
+Repository-wide case-insensitive scan for the deprecated recurrence endpoint token returned zero matches.
+Unsupported endpoint names fail validation; no endpoint-name aliasing or migration is performed by the public release.

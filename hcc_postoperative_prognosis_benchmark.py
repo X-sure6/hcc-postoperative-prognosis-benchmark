@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HCC postoperative prognosis benchmark — fixed-fold cross-validation and prespecified S3 temporal validation.
+HCC postoperative prognosis benchmark — strict fixed-fold cross-validation, five-fold OOF SHAP, and prespecified S3 temporal validation.
 
 This single script retains the original strict five-fold internal CV benchmark
 and implements the sole prespecified S3 full-development interval-gap temporal validation protocol.
@@ -15,14 +15,16 @@ Final analysis definition
 - Tumor Size >5 cm is included only in ICPI
 - "无" and unresolvable abnormal values become missing before training-set-only KNN
 - Initial treatment date is used only for temporal splitting
-- Internal CV keeps three feature-set workers and the original CV model protocol
+- Internal CV keeps three feature-set workers and requires complete five-fold success for every reported configuration
 - S3 temporal validation uses all development-period patients for training, with no internal split or cross-validation
-- Temporal validation is restricted to OS12m, OS24m, RFS12m and RFS24m
+- Temporal validation is restricted to OS12m, OS24m, TTR12m and TTR24m
 - Temporal classification threshold is prespecified at 0.5 for every model
 - Temporal TabNet is a 20-seed (42–61), 100-epoch probability-mean ensemble
 - Temporal bootstrap CIs, calibration, DCA and paired bootstrap comparisons are exported
 - Random seed for non-TabNet models: 42
 - V8 predictor roles are locked to 31 continuous and 25 categorical variables
+- TabPFN requires the audited local v2.5 checkpoint on CUDA; default/download/CPU fallback is forbidden
+- SHAP uses all five held-out outer folds and pools patient-level explanations exactly once per analyzable patient
 - Deterministic V8 cleaning, derived-indicator reconciliation, and manual-review audits are exported
 - Optional parallel CV/temporal scheduling uses Linux process-level GPU slot locks
 
@@ -107,9 +109,11 @@ DCA_THRESHOLDS = np.round(np.arange(0.01, 0.99, 0.01), 2)
 
 ALL_TARGETS = [
     "OS12m", "OS24m", "OS36m", "OS48m", "OS60m",
-    "RFS12m", "RFS24m", "RFS36m", "RFS48m", "RFS60m",
+    "TTR12m", "TTR24m", "TTR36m", "TTR48m", "TTR60m",
 ]
-TEMPORAL_TARGETS = ["OS12m", "OS24m", "RFS12m", "RFS24m"]
+TEMPORAL_TARGETS = ["OS12m", "OS24m", "TTR12m", "TTR24m"]
+EXPECTED_TABPFN_CHECKPOINT_SHA256 = "5d7170e2d3af01f9c501bb09ec3bd12e9944f8604de18002c647873c6ec04a12"
+TABPFN_POLICY = "STRICT_LOCAL_CHECKPOINT_NO_FALLBACK_V1"
 FEATURE_SET_ORDER = ["classic_preop", "postop_total", "full_data"]
 FEATURE_SET_DISPLAY = {
     "classic_preop": "PCI",
@@ -137,10 +141,10 @@ BCLC_CANDIDATES = [
 ]
 
 TEMPORAL_DEV_START = pd.Timestamp("2015-10-05")
-TEMPORAL_DEV_END = pd.Timestamp("2019-06-30")
-TEMPORAL_GAP_START = pd.Timestamp("2019-07-01")
-TEMPORAL_GAP_END = pd.Timestamp("2019-09-30")
-TEMPORAL_VAL_START = pd.Timestamp("2019-10-01")
+TEMPORAL_DEV_END = pd.Timestamp("2019-09-30")
+TEMPORAL_GAP_START = pd.Timestamp("2019-10-01")
+TEMPORAL_GAP_END = pd.Timestamp("2019-12-31")
+TEMPORAL_VAL_START = pd.Timestamp("2020-01-01")
 TEMPORAL_VAL_END = pd.Timestamp("2020-12-25")
 TEMPORAL_SPLIT_NAME = "S3_gap3m_2019Q4_to_2020"
 TEMPORAL_SPLIT_IS_SOLE_PRESPECIFIED_ANALYSIS = True
@@ -356,8 +360,11 @@ class WorkerConfig:
     cnlc_col: Optional[str]
     bclc_col: Optional[str]
     feature_sets: Dict[str, List[str]]
+    selected_feature_sets: List[str]
     models: List[str]
+    targets: List[str]
     tabpfn_checkpoint: str
+    tabpfn_checkpoint_sha256: str
     model_n_jobs: int
     temporal_model_n_jobs: int
     bootstrap_rounds: int
@@ -366,6 +373,7 @@ class WorkerConfig:
     run_shap: bool
     shap_background: int
     shap_test: int
+    shap_chunk_size: int
     save_fold_data: bool
     save_direct_identifiers: bool
 
@@ -509,6 +517,80 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def validate_endpoint_names(values: Sequence[str], where: str, *, allow_subset: bool = True) -> None:
+    observed = {str(v).strip() for v in values}
+    allowed = set(ALL_TARGETS)
+    unexpected = sorted(v for v in observed if v and v not in allowed)
+    if unexpected:
+        raise ValueError(
+            f"{where} contains unsupported endpoint names: {unexpected}. "
+            "This release accepts only the prespecified OS and TTR fixed-time endpoints."
+        )
+    if not allow_subset:
+        missing = sorted(allowed - observed)
+        if missing:
+            raise ValueError(f"{where} is missing prespecified endpoints: {missing}")
+
+
+def validate_tabpfn_checkpoint(checkpoint: str, expected_sha256: str = EXPECTED_TABPFN_CHECKPOINT_SHA256) -> Dict[str, Any]:
+    if not checkpoint:
+        raise ValueError(
+            "TabPFN is selected but --tabpfn-checkpoint is empty. "
+            "This audited release forbids the default constructor and remote downloads."
+        )
+    path = Path(checkpoint)
+    if not path.is_file():
+        raise FileNotFoundError(f"TabPFN checkpoint does not exist: {path}")
+    digest = sha256_file(path)
+    if expected_sha256 and digest.lower() != expected_sha256.lower():
+        raise ValueError(
+            "TabPFN checkpoint SHA256 mismatch. "
+            f"expected={expected_sha256}, observed={digest}. "
+            "Use the audited v2.5 checkpoint or explicitly supply the intended hash."
+        )
+    return {
+        "policy": TABPFN_POLICY,
+        "checkpoint_path": str(path),
+        "checkpoint_sha256": digest,
+        "checkpoint_size_bytes": int(path.stat().st_size),
+        "device": "cuda",
+        "random_state": RANDOM_STATE,
+        "default_constructor_allowed": False,
+        "remote_download_allowed": False,
+        "cpu_fallback_allowed": False,
+    }
+
+
+@contextlib.contextmanager
+def tabpfn_offline_guard():
+    """Block accidental model downloads while constructing/fitting TabPFN.
+
+    Explicit local checkpoint loading remains available. The guard is intentionally
+    narrow and is used only around TabPFN constructor/fit/predict calls.
+    """
+    env_keys = {
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+    }
+    old_env = {k: os.environ.get(k) for k in env_keys}
+    os.environ.update(env_keys)
+    import socket
+    original_create_connection = socket.create_connection
+    def blocked_create_connection(*args, **kwargs):
+        raise RuntimeError("Network access is blocked by STRICT_LOCAL_CHECKPOINT_NO_FALLBACK policy")
+    socket.create_connection = blocked_create_connection
+    try:
+        yield
+    finally:
+        socket.create_connection = original_create_connection
+        for k, old in old_env.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
 
 
 def safe_slug(text: str) -> str:
@@ -891,21 +973,33 @@ def build_v8_manual_review_audit(
 # Binary outcomes, metrics and curves
 # -----------------------------------------------------------------------------
 def sanitize_binary_y(series: pd.Series) -> pd.Series:
-    mapping = {
-        "0": 0, "1": 1, "false": 0, "true": 1, "no": 0, "yes": 1,
-        "negative": 0, "positive": 1, "neg": 0, "pos": 1,
-        "alive": 0, "dead": 1, "event_free": 0, "event": 1,
-    }
-    y = series.copy()
-    if y.dtype == object:
-        y = y.astype(str).str.strip().str.lower().replace(mapping)
-    y = pd.to_numeric(y, errors="coerce").dropna()
-    unique = sorted(pd.Series(y).unique().tolist())
-    if len(unique) != 2:
-        raise ValueError(f"标签不是二分类，唯一值: {unique}")
-    if unique != [0, 1]:
-        y = y.map({unique[0]: 0, unique[1]: 1})
-    return y.astype(int)
+    """Return a strict 0/1 outcome without semantic recoding.
+
+    Missing values are allowed because fixed-time tasks have endpoint-specific
+    analyzable sets. Any *non-missing* value other than numeric/bool 0 or 1 is fatal.
+    In particular, {1, 2} is never silently remapped to {0, 1}.
+    """
+    nonmissing = series[series.notna()].copy()
+    if nonmissing.empty:
+        raise ValueError("Outcome contains no non-missing observations")
+    # Accept booleans and literal numeric 0/1, including strings '0'/'1'.
+    text = nonmissing.astype(str).str.strip()
+    numeric = pd.to_numeric(text, errors="coerce")
+    invalid_parse = numeric.isna()
+    if invalid_parse.any():
+        examples = nonmissing.loc[invalid_parse].astype(str).head(10).tolist()
+        raise ValueError(f"Outcome contains non-numeric/non-binary values: {examples}")
+    unique = sorted(pd.Series(numeric).unique().tolist())
+    if not set(unique).issubset({0, 1, 0.0, 1.0}):
+        raise ValueError(
+            f"Outcome must be encoded explicitly as 0/1; observed unique values={unique}. "
+            "Silent binary recoding is disabled."
+        )
+    y = numeric.astype(int)
+    y.index = nonmissing.index
+    if sorted(y.unique().tolist()) != [0, 1]:
+        raise ValueError(f"Outcome task requires both classes 0 and 1; observed={sorted(y.unique().tolist())}")
+    return y
 
 
 def safe_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
@@ -1222,35 +1316,52 @@ class BaseModel:
 
 
 class TabPFNModel(BaseModel):
-    def __init__(self, checkpoint: str):
+    def __init__(self, checkpoint: str, checkpoint_sha256: str = EXPECTED_TABPFN_CHECKPOINT_SHA256):
         if not TABPFN_AVAILABLE:
-            raise ImportError("tabpfn 未安装")
-        self.checkpoint = checkpoint
+            raise ImportError("tabpfn is not installed")
+        if not TORCH_AVAILABLE or not torch.cuda.is_available():
+            raise RuntimeError("TabPFN requires CUDA in the audited no-fallback release; CPU fallback is disabled")
+        self.checkpoint = str(Path(checkpoint).resolve()) if checkpoint else ""
+        self.checkpoint_sha256 = checkpoint_sha256
+        self.audit = validate_tabpfn_checkpoint(self.checkpoint, checkpoint_sha256)
         self.model = None
 
     def fit(self, X_train: pd.DataFrame, y_train: np.ndarray, X_val: Optional[pd.DataFrame] = None, y_val: Optional[np.ndarray] = None) -> "TabPFNModel":
-        kwargs: Dict[str, Any] = {}
-        if self.checkpoint:
-            kwargs["model_path"] = self.checkpoint
-        for candidate in (
-            {**kwargs, "device": "cuda", "random_state": RANDOM_STATE},
-            {**kwargs, "device": "cuda"},
-            kwargs,
-            {},
-        ):
-            try:
-                self.model = TabPFNClassifier(**candidate)
-                break
-            except TypeError:
-                continue
-        if self.model is None:
-            raise RuntimeError("无法构建 TabPFNClassifier")
-        self.model.fit(X_train.to_numpy(dtype=np.float32), y_train.astype(int))
+        # Deliberately use one constructor only. If the installed API is incompatible,
+        # fail rather than retrying without random_state/model_path/device.
+        kwargs = {
+            "model_path": self.checkpoint,
+            "device": "cuda",
+            "random_state": RANDOM_STATE,
+        }
+        try:
+            with tabpfn_offline_guard():
+                self.model = TabPFNClassifier(**kwargs)
+                self.model.fit(X_train.to_numpy(dtype=np.float32), y_train.astype(int))
+        except TypeError as exc:
+            raise RuntimeError(
+                "Installed tabpfn API is incompatible with the audited constructor. "
+                "Use tabpfn==6.4.1 for R9.3 reproduction; no constructor fallback is permitted."
+            ) from exc
         return self
 
     def predict_proba_1(self, X: pd.DataFrame) -> np.ndarray:
-        p = self.model.predict_proba(X.to_numpy(dtype=np.float32))
-        return p[:, 1] if p.shape[1] >= 2 else np.zeros(len(X))
+        if self.model is None:
+            raise RuntimeError("TabPFN model has not been fitted")
+        with tabpfn_offline_guard():
+            p = self.model.predict_proba(X.to_numpy(dtype=np.float32))
+        if p.ndim != 2 or p.shape[1] < 2:
+            raise RuntimeError(f"Unexpected TabPFN predict_proba shape: {p.shape}")
+        return p[:, 1]
+
+    def checkpoint_audit(self) -> Dict[str, Any]:
+        audit = dict(self.audit)
+        audit.update({
+            "estimator_model_path": self.checkpoint,
+            "network_blocked": True,
+            "tabpfn_version": getattr(sys.modules.get("tabpfn"), "__version__", "unknown"),
+        })
+        return audit
 
 
 class TabNetModel(BaseModel):
@@ -1395,7 +1506,7 @@ class StageRateModel(BaseModel):
 
 def make_model(model_name: str, phase: str, cfg: WorkerConfig) -> BaseModel:
     if model_name == "TabPFN":
-        return TabPFNModel(cfg.tabpfn_checkpoint)
+        return TabPFNModel(cfg.tabpfn_checkpoint, cfg.tabpfn_checkpoint_sha256)
     if model_name == "TabNet":
         return TabNetModel()
     if model_name == "XGBoost":
@@ -1417,7 +1528,7 @@ def make_model(model_name: str, phase: str, cfg: WorkerConfig) -> BaseModel:
 
 def dependency_status(model_name: str, cfg: WorkerConfig) -> Tuple[bool, str]:
     if model_name == "TabPFN":
-        return TABPFN_AVAILABLE, "tabpfn missing"
+        return (TABPFN_AVAILABLE and bool(cfg.tabpfn_checkpoint)), "tabpfn missing or checkpoint not supplied"
     if model_name == "TabNet":
         return TABNET_AVAILABLE, "pytorch-tabnet missing"
     if model_name == "XGBoost":
@@ -1457,6 +1568,7 @@ def read_fold_long(path: str | Path) -> pd.DataFrame:
     df["sample_id"] = df["sample_id"].map(normalize_id)
     df["split"] = df["split"].astype(str).str.strip().str.lower()
     df["target"] = df["target"].astype(str).str.strip()
+    validate_endpoint_names(df["target"].unique().tolist(), "fixed-fold file", allow_subset=True)
     return df
 
 
@@ -1506,82 +1618,282 @@ def split_indices_from_fold(fold_df: pd.DataFrame, fold: int) -> Tuple[pd.Index,
 
 
 # -----------------------------------------------------------------------------
-# SHAP generation and aggregation
+# SHAP generation and five-fold OOF aggregation
 # -----------------------------------------------------------------------------
-def run_generic_shap(model: BaseModel, X_train: pd.DataFrame, X_test: pd.DataFrame, outdir: Path, background_n: int, test_n: int) -> None:
+def _extract_class1_shap(explanation: Any) -> Tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(explanation.values)
+    base = np.asarray(explanation.base_values)
+    if values.ndim == 3:
+        if values.shape[2] < 2:
+            raise ValueError(f"Unexpected multiclass SHAP shape: {values.shape}")
+        class1 = values[:, :, 1]
+        if base.ndim >= 2 and base.shape[-1] >= 2:
+            base1 = base[..., 1]
+        else:
+            base1 = base
+    elif values.ndim == 2:
+        class1 = values
+        base1 = base
+    else:
+        raise ValueError(f"Unexpected SHAP values shape: {values.shape}")
+    return np.asarray(class1, dtype=float), np.asarray(base1, dtype=float)
+
+
+def run_oof_shap_fold(
+    model: BaseModel,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    cleaned_test: pd.DataFrame,
+    sample_index: Sequence[int],
+    y_test: np.ndarray,
+    target: str,
+    feature_set: str,
+    fold: int,
+    outdir: Path,
+    background_n: int,
+    test_cap: int,
+    chunk_size: int,
+) -> None:
+    """Explain the held-out test fold and save patient-level SHAP values.
+
+    test_cap=0 means all held-out patients. R9.3 used background<=60 and chunks of 8.
+    Historical predictions are never used to gate explanation completion.
+    """
     ensure_dir(outdir)
     if not SHAP_AVAILABLE:
-        (outdir / "shap_unavailable.txt").write_text("shap is not installed", encoding="utf-8")
-        return
+        raise ImportError("shap is required when --skip-shap is not set")
     if any(re.search(r"\.\d+$", c) for c in X_train.columns):
-        raise ValueError("SHAP 检测到 .1/.2 重复特征")
-    rng = np.random.default_rng(RANDOM_STATE)
-    bg_idx = np.arange(len(X_train)) if len(X_train) <= background_n else np.sort(rng.choice(len(X_train), background_n, replace=False))
-    ts_idx = np.arange(len(X_test)) if len(X_test) <= test_n else np.sort(rng.choice(len(X_test), test_n, replace=False))
+        raise ValueError("SHAP detected duplicate .1/.2 feature names")
+    if list(X_test.columns) != list(X_train.columns):
+        raise ValueError("SHAP train/test feature columns differ")
+    if list(cleaned_test.columns) != list(X_train.columns):
+        raise ValueError("SHAP cleaned display values do not align with model feature columns")
+    if len(X_test) != len(sample_index) or len(X_test) != len(y_test):
+        raise ValueError("SHAP held-out metadata length mismatch")
+
+    # Deterministic SHAP seed, fixed separately for every endpoint,
+    # feature set and outer fold.
+    shap_seed = stable_seed("shap", target, feature_set, fold, base=0)
+    rng = np.random.default_rng(shap_seed)
+    bg_idx = np.arange(len(X_train)) if len(X_train) <= background_n else np.sort(
+        rng.choice(len(X_train), background_n, replace=False)
+    )
     background = X_train.iloc[bg_idx]
-    test = X_test.iloc[ts_idx]
+    if test_cap and test_cap > 0 and len(X_test) > test_cap:
+        selected = np.sort(rng.choice(len(X_test), test_cap, replace=False))
+    else:
+        selected = np.arange(len(X_test))
+    X_explain = X_test.iloc[selected]
+    cleaned_explain = cleaned_test.iloc[selected].copy()
+    sample_index = np.asarray(sample_index, dtype=int)[selected]
+    y_explain = np.asarray(y_test, dtype=int)[selected]
 
     def predict_fn(arr: np.ndarray) -> np.ndarray:
         xx = pd.DataFrame(arr, columns=X_train.columns)
         p1 = model.predict_proba_1(xx)
         return np.column_stack([1 - p1, p1])
 
-    try:
-        explainer = shap.PermutationExplainer(predict_fn, background.to_numpy(dtype=float), feature_names=list(X_train.columns))
-        explanation = explainer(test.to_numpy(dtype=float), max_evals=max(2 * X_train.shape[1] + 1, 101))
-        values = explanation.values
-        np.save(outdir / "generic_shap_values.npy", values)
-        if values.ndim == 3:
-            class1 = values[:, :, 1]
-            base = explanation.base_values[:, 1] if np.ndim(explanation.base_values) > 1 else explanation.base_values
-            plot_exp = shap.Explanation(values=class1, base_values=base, data=test.to_numpy(float), feature_names=list(X_train.columns))
-        else:
-            class1 = values
-            plot_exp = explanation
-        imp = pd.DataFrame({"feature": X_train.columns, "mean_abs_shap": np.abs(class1).mean(axis=0)})
-        imp.sort_values("mean_abs_shap", ascending=False).to_csv(outdir / "generic_shap_importance.csv", index=False, encoding="utf-8-sig")
-        try:
-            shap.plots.beeswarm(plot_exp, max_display=20, show=False)
-            plt.tight_layout()
-            plt.savefig(outdir / "generic_shap_beeswarm.png", dpi=180, bbox_inches="tight")
-            plt.close()
-            shap.plots.bar(plot_exp, max_display=20, show=False)
-            plt.tight_layout()
-            plt.savefig(outdir / "generic_shap_bar.png", dpi=180, bbox_inches="tight")
-            plt.close()
-        except Exception:
-            plt.close("all")
-    except Exception:
-        (outdir / "generic_shap_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+    explainer = shap.PermutationExplainer(
+        predict_fn,
+        background.to_numpy(dtype=float),
+        feature_names=list(X_train.columns),
+        seed=shap_seed,
+    )
+    max_evals = max(2 * X_train.shape[1] + 1, 101)
+    chunk_size = max(1, int(chunk_size))
+    shap_chunks: List[np.ndarray] = []
+    base_chunks: List[np.ndarray] = []
+    for start_idx in range(0, len(X_explain), chunk_size):
+        chunk = X_explain.iloc[start_idx:start_idx + chunk_size]
+        explanation = explainer(chunk.to_numpy(dtype=float), max_evals=max_evals)
+        class1, base1 = _extract_class1_shap(explanation)
+        shap_chunks.append(class1)
+        base_chunks.append(np.atleast_1d(base1))
+    class1 = np.concatenate(shap_chunks, axis=0)
+    base1 = np.concatenate(base_chunks, axis=0)
+    if class1.shape != (len(X_explain), X_train.shape[1]):
+        raise ValueError(f"Unexpected class-1 SHAP shape {class1.shape}")
+
+    np.save(outdir / "shap_class1_values.npy", class1)
+    np.save(outdir / "base_values.npy", base1)
+    np.save(outdir / "model_input_values.npy", X_explain.to_numpy(dtype=np.float32))
+    save_json(list(X_train.columns), outdir / "feature_names.json")
+    display = cleaned_explain.copy()
+    display.insert(0, "sample_index", sample_index)
+    display.to_csv(outdir / "test_cleaned_feature_values.csv", index=False, encoding="utf-8-sig")
+    meta = pd.DataFrame({
+        "target": target,
+        "feature_set": feature_set,
+        "display": FEATURE_SET_DISPLAY[feature_set],
+        "fold": int(fold),
+        "sample_index": sample_index,
+        "y_true": y_explain,
+        "shap_row": np.arange(len(sample_index), dtype=int),
+    })
+    meta.to_csv(outdir / "test_sample_metadata.csv", index=False, encoding="utf-8-sig")
+    imp = pd.DataFrame({
+        "feature": list(X_train.columns),
+        "mean_abs_shap": np.abs(class1).mean(axis=0),
+    }).sort_values("mean_abs_shap", ascending=False)
+    imp["rank"] = np.arange(1, len(imp) + 1)
+    imp.to_csv(outdir / "fold_importance.csv", index=False, encoding="utf-8-sig")
+    save_json({
+        "status": "PASS",
+        "target": target,
+        "feature_set": feature_set,
+        "display": FEATURE_SET_DISPLAY[feature_set],
+        "fold": int(fold),
+        "n_train": int(len(X_train)),
+        "n_test_original": int(len(X_test)),
+        "n_explained": int(len(X_explain)),
+        "n_features": int(X_train.shape[1]),
+        "background_size": int(len(background)),
+        "chunk_size": int(chunk_size),
+        "max_evals": int(max_evals),
+        "shap_seed": int(shap_seed),
+        "all_test_patients_explained": bool(len(X_explain) == len(X_test)),
+        "beeswarm_color_values": "cleaned pre-standardization feature values; exact model inputs saved separately",
+        "reference_comparison_policy": "postrun_nonblocking_diagnostic_only",
+    }, outdir / "fold_completion.json")
+
+
+def aggregate_shap_configuration(model_dir: Path, target: str, feature_set: str, expected_oof: pd.DataFrame) -> Dict[str, Any]:
+    """Pool the five held-out SHAP folds; every analyzable patient must appear once."""
+    fold_values = []
+    fold_inputs = []
+    fold_meta = []
+    fold_cleaned = []
+    fold_importances = []
+    feature_names = None
+    for fold in range(1, N_OUTER_FOLDS + 1):
+        shap_dir = model_dir / "folds" / f"fold_{fold}" / "shap"
+        completion = json.loads((shap_dir / "fold_completion.json").read_text(encoding="utf-8"))
+        if completion.get("status") != "PASS":
+            raise RuntimeError(f"SHAP fold incomplete: {shap_dir}")
+        names = json.loads((shap_dir / "feature_names.json").read_text(encoding="utf-8"))
+        if feature_names is None:
+            feature_names = names
+        elif feature_names != names:
+            raise ValueError(f"SHAP feature-name mismatch across folds for {target}/{feature_set}")
+        vals = np.load(shap_dir / "shap_class1_values.npy")
+        inputs = np.load(shap_dir / "model_input_values.npy")
+        meta = pd.read_csv(shap_dir / "test_sample_metadata.csv")
+        cleaned = pd.read_csv(shap_dir / "test_cleaned_feature_values.csv")
+        imp = pd.read_csv(shap_dir / "fold_importance.csv")
+        imp["fold"] = fold
+        fold_values.append(vals)
+        fold_inputs.append(inputs)
+        fold_meta.append(meta)
+        fold_cleaned.append(cleaned)
+        fold_importances.append(imp)
+    values = np.concatenate(fold_values, axis=0)
+    inputs = np.concatenate(fold_inputs, axis=0)
+    meta = pd.concat(fold_meta, ignore_index=True)
+    cleaned = pd.concat(fold_cleaned, ignore_index=True)
+    if meta["sample_index"].duplicated().any():
+        raise ValueError(f"OOF SHAP duplicate patients for {target}/{feature_set}")
+    expected = expected_oof[["sample_index", "y_true"]].copy()
+    observed = meta[["sample_index", "y_true"]].copy()
+    merged = expected.merge(observed, on="sample_index", how="outer", suffixes=("_pred", "_shap"), indicator=True)
+    if not (merged["_merge"] == "both").all() or not (merged["y_true_pred"] == merged["y_true_shap"]).all():
+        raise ValueError(f"OOF SHAP coverage/y_true mismatch for {target}/{feature_set}")
+    order = np.argsort(meta["sample_index"].to_numpy(int))
+    values = values[order]
+    inputs = inputs[order]
+    meta = meta.iloc[order].reset_index(drop=True)
+    cleaned = cleaned.set_index("sample_index").loc[meta["sample_index"].tolist()].reset_index()
+    outdir = ensure_dir(model_dir / "shap_oof")
+    np.save(outdir / "oof_shap_class1_values.npy", values)
+    np.save(outdir / "oof_model_input_values.npy", inputs)
+    meta.to_csv(outdir / "oof_sample_metadata.csv", index=False, encoding="utf-8-sig")
+    cleaned.to_csv(outdir / "oof_cleaned_feature_values.csv", index=False, encoding="utf-8-sig")
+    save_json(feature_names, outdir / "oof_feature_names.json")
+    importance = pd.DataFrame({
+        "feature": feature_names,
+        "mean_abs_shap": np.abs(values).mean(axis=0),
+    }).sort_values("mean_abs_shap", ascending=False)
+    importance["rank"] = np.arange(1, len(importance) + 1)
+    importance.to_csv(outdir / "oof_importance.csv", index=False, encoding="utf-8-sig")
+    fi = pd.concat(fold_importances, ignore_index=True)
+    stability = fi.groupby("feature", as_index=False).agg(
+        mean_abs_shap=("mean_abs_shap", "mean"),
+        sd_abs_shap=("mean_abs_shap", "std"),
+        mean_rank=("rank", "mean"),
+        top10_frequency=("rank", lambda x: int((x <= 10).sum())),
+        folds=("fold", "nunique"),
+    ).sort_values(["mean_rank", "mean_abs_shap"], ascending=[True, False])
+    stability.to_csv(outdir / "fivefold_stability.csv", index=False, encoding="utf-8-sig")
+    completion = {
+        "status": "PASS",
+        "target": target,
+        "feature_set": feature_set,
+        "display": FEATURE_SET_DISPLAY[feature_set],
+        "folds": N_OUTER_FOLDS,
+        "expected_analyzable_n": int(len(expected_oof)),
+        "observed_oof_n": int(len(meta)),
+        "unique_oof_patients": int(meta["sample_index"].nunique()),
+        "complete_oof_coverage": True,
+        "n_features": int(len(feature_names)),
+        "beeswarm_is_patient_level_fivefold_pooled": True,
+        "legacy_single_fold_points_reused": False,
+        "reference_comparison_policy": "postrun_nonblocking_prediction_difference_report",
+        "reference_comparison_blocks_shap": False,
+        "tabpfn_policy": TABPFN_POLICY,
+        "tabpfn_fallback_allowed": False,
+    }
+    save_json(completion, outdir / "config_completion.json")
+    return completion
 
 
 def aggregate_shap(cv_root: Path, summary_root: Path) -> pd.DataFrame:
+    """Aggregate OOF SHAP importance/stability across all 30 TabPFN configurations."""
     rows = []
-    for path in cv_root.glob("*/**/generic_shap_importance.csv"):
-        # Expected: cv/target/feature_set/TabPFN/folds/fold_1/shap/generic_shap_importance.csv
-        parts = path.relative_to(cv_root).parts
-        if len(parts) < 3:
-            continue
-        target, feature_set = parts[0], parts[1]
-        df = pd.read_csv(path)
-        if any(re.search(r"\.\d+$", str(x)) for x in df["feature"]):
-            raise ValueError(f"SHAP 汇总检测到重复特征: {path}")
-        df["target"] = target
-        df["feature_set"] = feature_set
-        df["model"] = "TabPFN"
-        df["fold"] = 1
-        df["rank"] = df["mean_abs_shap"].rank(method="first", ascending=False).astype(int)
-        rows.append(df)
+    stability_rows = []
+    completions = []
+    for target in ALL_TARGETS:
+        for feature_set in FEATURE_SET_ORDER:
+            model_dir = cv_root / target / feature_set / "TabPFN"
+            oof_path = model_dir / "all_test_predictions.csv"
+            if not oof_path.exists():
+                continue
+            expected_oof = pd.read_csv(oof_path)
+            completion = aggregate_shap_configuration(model_dir, target, feature_set, expected_oof)
+            completions.append(completion)
+            imp = pd.read_csv(model_dir / "shap_oof" / "oof_importance.csv")
+            imp["target"] = target
+            imp["feature_set"] = feature_set
+            imp["model"] = "TabPFN"
+            rows.append(imp)
+            stab = pd.read_csv(model_dir / "shap_oof" / "fivefold_stability.csv")
+            stab["target"] = target
+            stab["feature_set"] = feature_set
+            stability_rows.append(stab)
     if not rows:
         return pd.DataFrame()
+    if len(completions) != len(ALL_TARGETS) * len(FEATURE_SET_ORDER):
+        raise RuntimeError(f"Expected 30 complete OOF SHAP configurations, found {len(completions)}")
     long_df = pd.concat(rows, ignore_index=True)
+    stability_df = pd.concat(stability_rows, ignore_index=True)
     ensure_dir(summary_root)
-    long_df.to_csv(summary_root / "shap_long_table.csv", index=False, encoding="utf-8-sig")
-    long_df[long_df["rank"] <= 20].to_csv(summary_root / "shap_top20.csv", index=False, encoding="utf-8-sig")
-    mean_df = long_df.groupby(["feature_set", "feature"], as_index=False)["mean_abs_shap"].mean().sort_values(["feature_set", "mean_abs_shap"], ascending=[True, False])
-    mean_df.to_csv(summary_root / "shap_mean_importance.csv", index=False, encoding="utf-8-sig")
-    freq = long_df.assign(top10=long_df["rank"] <= 10).groupby(["feature_set", "feature"], as_index=False)["top10"].sum().rename(columns={"top10": "top10_frequency"})
-    freq.to_csv(summary_root / "shap_top10_frequency.csv", index=False, encoding="utf-8-sig")
+    long_df.to_csv(summary_root / "shap_oof_importance_all_30config.csv", index=False, encoding="utf-8-sig")
+    stability_df.to_csv(summary_root / "shap_fivefold_stability_all_30config.csv", index=False, encoding="utf-8-sig")
+    save_json({
+        "status": "PASS",
+        "final_beeswarm_configurations": len(completions),
+        "expected_final_beeswarm_configurations": 30,
+        "underlying_fold_tasks": len(completions) * N_OUTER_FOLDS,
+        "feature_sets": FEATURE_SET_ORDER,
+        "targets": ALL_TARGETS,
+        "all_configurations_have_five_folds": True,
+        "all_configurations_complete_oof": True,
+        "patient_level_shap_saved": True,
+        "feature_values_saved": True,
+        "legacy_point_cloud_reused": False,
+        "tabpfn_policy": TABPFN_POLICY,
+        "tabpfn_fallback_allowed": False,
+        "reference_comparison_policy": "postrun_nonblocking_diagnostic_only",
+        "reference_comparison_blocks_beeswarm": False,
+    }, summary_root / "OOF_SHAP_completion_summary.json")
     return long_df
 
 
@@ -1659,7 +1971,7 @@ def run_cv_feature_set_worker(feature_set: str, cfg_dict: Dict[str, Any]) -> Dic
     dca_rows: List[pd.DataFrame] = []
     boot_rows: List[pd.DataFrame] = []
 
-    for target in ALL_TARGETS:
+    for target in cfg.targets:
         task, y, sample_ids = prepare_target(df, target, cfg.id_col)
         folds = validate_target_folds(fold_long, target, task, sample_ids)
         for model_name in run_models:
@@ -1720,11 +2032,25 @@ def run_cv_feature_set_worker(feature_set: str, cfg_dict: Dict[str, Any]) -> Dic
                         threshold, roc_df = compute_youden_threshold(y_val, val_prob)
                         test_prob = model.predict_proba_1(X_test)
                         metrics = compute_metrics(y_test, test_prob, threshold)
-                        if model_name == "TabPFN" and fold == 1 and cfg.run_shap:
-                            run_generic_shap(
-                                model, X_train, X_test, fold_dir / "shap",
-                                cfg.shap_background, cfg.shap_test,
-                            )
+                        if model_name == "TabPFN":
+                            save_json(model.checkpoint_audit(), fold_dir / "tabpfn_strict_checkpoint_audit.json")
+                            if cfg.run_shap:
+                                cleaned_test = X_raw.loc[test_idx, X_train.columns].copy()
+                                run_oof_shap_fold(
+                                    model=model,
+                                    X_train=X_train,
+                                    X_test=X_test,
+                                    cleaned_test=cleaned_test,
+                                    sample_index=test_idx.astype(int),
+                                    y_test=y_test,
+                                    target=target,
+                                    feature_set=feature_set,
+                                    fold=fold,
+                                    outdir=fold_dir / "shap",
+                                    background_n=cfg.shap_background,
+                                    test_cap=cfg.shap_test,
+                                    chunk_size=cfg.shap_chunk_size,
+                                )
                         if model_name in GPU_MODELS:
                             del model
                             model = None
@@ -1759,8 +2085,15 @@ def run_cv_feature_set_worker(feature_set: str, cfg_dict: Dict[str, Any]) -> Dic
                     err = f"{type(exc).__name__}: {exc}"
                     error_dir = ensure_dir(model_dir / "folds" / f"fold_{fold}")
                     (error_dir / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
-                    log_line(f"ERROR | CV | {feature_set} | {target} | {model_name} | fold {fold}: {err}", worker_log)
+                    log_line(f"FATAL | CV | {feature_set} | {target} | {model_name} | fold {fold}: {err}", worker_log)
                     model_fold_results.append(empty_model_result("cv", target, feature_set, model_name, "error", err, fold=fold, n_samples=len(task), n_train=len(train_idx), n_val=len(val_idx), n_test=len(test_idx), n_features=len(fs_cols)))
+                    pd.DataFrame([asdict(r) for r in model_fold_results]).to_csv(
+                        model_dir / "FAILED_fold_metrics.csv", index=False, encoding="utf-8-sig"
+                    )
+                    raise RuntimeError(
+                        f"Strict CV aborted because {target}/{feature_set}/{model_name}/fold {fold} failed. "
+                        "Partial folds are never pooled or ranked."
+                    ) from exc
                 finally:
                     try:
                         del model
@@ -1770,8 +2103,22 @@ def run_cv_feature_set_worker(feature_set: str, cfg_dict: Dict[str, Any]) -> Dic
 
             for r in model_fold_results:
                 result_rows.append(asdict(r))
+            ok_folds = [r.fold for r in model_fold_results if r.status == "ok"]
+            if ok_folds != list(range(1, N_OUTER_FOLDS + 1)) or len(model_preds) != N_OUTER_FOLDS:
+                raise RuntimeError(
+                    f"Incomplete five-fold configuration {target}/{feature_set}/{model_name}: "
+                    f"ok_folds={ok_folds}, prediction_folds={len(model_preds)}"
+                )
             if model_preds:
                 oof = pd.concat(model_preds, ignore_index=True)
+                expected_indices = set(map(int, task.index.tolist()))
+                observed_indices = oof["sample_index"].astype(int)
+                if len(oof) != len(expected_indices) or observed_indices.nunique() != len(expected_indices):
+                    raise RuntimeError(f"Incomplete/duplicated OOF coverage for {target}/{feature_set}/{model_name}")
+                if set(observed_indices.tolist()) != expected_indices:
+                    raise RuntimeError(f"OOF patient set mismatch for {target}/{feature_set}/{model_name}")
+                if not set(oof["y_true"].astype(int).unique()).issubset({0, 1}):
+                    raise RuntimeError(f"Non-binary y_true found in OOF for {target}/{feature_set}/{model_name}")
                 oof.to_csv(model_dir / "all_test_predictions.csv", index=False, encoding="utf-8-sig")
                 fold_metrics = pd.DataFrame([asdict(r) for r in model_fold_results])
                 fold_metrics.to_csv(model_dir / "fold_metrics.csv", index=False, encoding="utf-8-sig")
@@ -1887,11 +2234,11 @@ def serializable_index(value: Any) -> Any:
 
 def temporal_model_available(
     model_name: str,
-    cnlc_col: Optional[str],
-    bclc_col: Optional[str],
+    cfg: WorkerConfig,
 ) -> Tuple[bool, str]:
+    cnlc_col, bclc_col = cfg.cnlc_col, cfg.bclc_col
     if model_name == "TabPFN":
-        return TABPFN_AVAILABLE, "tabpfn missing"
+        return (TABPFN_AVAILABLE and bool(cfg.tabpfn_checkpoint)), "tabpfn missing or checkpoint not supplied"
     if model_name == "TabNet":
         return TABNET_AVAILABLE, "pytorch-tabnet missing"
     if model_name == "XGBoost":
@@ -1908,41 +2255,45 @@ def temporal_model_available(
 
 
 class TemporalTabPFNModel(BaseModel):
-    def __init__(self, checkpoint: str, seed: int):
+    def __init__(self, checkpoint: str, seed: int, checkpoint_sha256: str = EXPECTED_TABPFN_CHECKPOINT_SHA256):
         if not TABPFN_AVAILABLE:
-            raise ImportError("tabpfn 未安装")
-        self.checkpoint = checkpoint
+            raise ImportError("tabpfn is not installed")
+        if not TORCH_AVAILABLE or not torch.cuda.is_available():
+            raise RuntimeError("Temporal TabPFN requires CUDA; CPU fallback is disabled")
+        self.checkpoint = str(Path(checkpoint).resolve()) if checkpoint else ""
         self.seed = int(seed)
+        self.checkpoint_sha256 = checkpoint_sha256
+        self.audit = validate_tabpfn_checkpoint(self.checkpoint, checkpoint_sha256)
         self.model = None
 
     def fit(self, X_train: pd.DataFrame, y_train: np.ndarray, X_val=None, y_val=None) -> "TemporalTabPFNModel":
-        kwargs: Dict[str, Any] = {}
-        if self.checkpoint:
-            if not Path(self.checkpoint).exists():
-                raise FileNotFoundError(f"TabPFN checkpoint 不存在: {self.checkpoint}")
-            kwargs["model_path"] = self.checkpoint
-        device = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
-        candidates = (
-            {**kwargs, "device": device, "random_state": self.seed},
-            {**kwargs, "device": device},
-            {**kwargs, "random_state": self.seed},
-            kwargs,
-            {},
-        )
-        for candidate in candidates:
-            try:
-                self.model = TabPFNClassifier(**candidate)
-                break
-            except TypeError:
-                continue
-        if self.model is None:
-            raise RuntimeError("无法构建 TabPFNClassifier")
-        self.model.fit(X_train.to_numpy(dtype=np.float32), y_train.astype(int))
+        try:
+            with tabpfn_offline_guard():
+                self.model = TabPFNClassifier(
+                    model_path=self.checkpoint,
+                    device="cuda",
+                    random_state=self.seed,
+                )
+                self.model.fit(X_train.to_numpy(dtype=np.float32), y_train.astype(int))
+        except TypeError as exc:
+            raise RuntimeError(
+                "Installed tabpfn API is incompatible with the audited temporal constructor; no fallback permitted"
+            ) from exc
         return self
 
     def predict_proba_1(self, X: pd.DataFrame) -> np.ndarray:
-        p = self.model.predict_proba(X.to_numpy(dtype=np.float32))
-        return p[:, 1] if p.shape[1] >= 2 else np.zeros(len(X))
+        if self.model is None:
+            raise RuntimeError("Temporal TabPFN model has not been fitted")
+        with tabpfn_offline_guard():
+            p = self.model.predict_proba(X.to_numpy(dtype=np.float32))
+        if p.ndim != 2 or p.shape[1] < 2:
+            raise RuntimeError(f"Unexpected TabPFN predict_proba shape: {p.shape}")
+        return p[:, 1]
+
+    def checkpoint_audit(self) -> Dict[str, Any]:
+        out = dict(self.audit)
+        out.update({"random_state": self.seed, "network_blocked": True})
+        return out
 
 
 class TemporalTabNetModel(BaseModel):
@@ -2074,7 +2425,7 @@ class TemporalRandomForestModel(BaseModel):
 
 def make_temporal_model(model_name: str, seed: int, cfg: WorkerConfig) -> BaseModel:
     if model_name == "TabPFN":
-        return TemporalTabPFNModel(cfg.tabpfn_checkpoint, seed)
+        return TemporalTabPFNModel(cfg.tabpfn_checkpoint, seed, cfg.tabpfn_checkpoint_sha256)
     if model_name == "TabNet":
         return TemporalTabNetModel(seed)
     if model_name == "XGBoost":
@@ -2210,7 +2561,7 @@ def run_temporal_primary_model(
 ) -> Tuple[TemporalPrimaryResult, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame]]:
     output_feature_set = feature_set if model_name in CORE_MODELS else f"{model_name}_only"
     model_dir = ensure_dir(temporal_root / target / output_feature_set / model_name)
-    available, reason = temporal_model_available(model_name, cfg.cnlc_col, cfg.bclc_col)
+    available, reason = temporal_model_available(model_name, cfg)
 
     n_train = len(training_idx)
     n_test = len(test_idx)
@@ -2373,6 +2724,8 @@ def run_temporal_primary_model(
                 model = make_temporal_model(model_name, RANDOM_STATE, cfg)
                 model.fit(X_train, y_train)
                 test_prob = np.asarray(model.predict_proba_1(X_test), dtype=float)
+                if model_name == "TabPFN" and hasattr(model, "checkpoint_audit"):
+                    save_json(model.checkpoint_audit(), model_dir / "tabpfn_strict_checkpoint_audit.json")
                 if model_name in GPU_MODELS:
                     del model
                     model = None
@@ -2913,8 +3266,12 @@ def run_temporal_worker(
 # Phase orchestration and summaries
 # -----------------------------------------------------------------------------
 def run_phase_in_executor(executor: ProcessPoolExecutor, worker_fn, phase_name: str, cfg: WorkerConfig) -> None:
-    log_line(f"Starting {phase_name} with 3 feature-set workers", Path(cfg.output_root) / "master.log")
-    futures = {executor.submit(worker_fn, fs, asdict(cfg)): fs for fs in FEATURE_SET_ORDER}
+    selected_feature_sets = [fs for fs in FEATURE_SET_ORDER if fs in cfg.selected_feature_sets]
+    log_line(
+        f"Starting {phase_name} with {len(selected_feature_sets)} selected feature-set task(s): {selected_feature_sets}",
+        Path(cfg.output_root) / "master.log",
+    )
+    futures = {executor.submit(worker_fn, fs, asdict(cfg)): fs for fs in selected_feature_sets}
     for future in as_completed(futures):
         fs = futures[future]
         try:
@@ -2946,6 +3303,14 @@ def summarize_cv(output_root: Path) -> Dict[str, pd.DataFrame]:
     bootstrap = concat_csvs(workers.glob("*_bootstrap.csv"))
 
     ok = fold_metrics[fold_metrics["status"] == "ok"].copy() if not fold_metrics.empty else pd.DataFrame()
+    if not fold_metrics.empty:
+        failures = fold_metrics[fold_metrics["status"] != "ok"]
+        if not failures.empty:
+            raise RuntimeError("CV summary contains failed folds; official summary generation is forbidden")
+        counts = ok.groupby(["target", "feature_set", "model"])["fold"].agg(["count", "nunique"]).reset_index()
+        bad = counts[(counts["count"] != N_OUTER_FOLDS) | (counts["nunique"] != N_OUTER_FOLDS)]
+        if not bad.empty:
+            raise RuntimeError(f"CV summary contains incomplete five-fold configurations: {bad.head(10).to_dict('records')}")
     metric_cols = ["AUROC", "AUPRC", "Accuracy", "Sensitivity", "Specificity", "Precision", "F1", "BrierScore"]
     if not ok.empty:
         grouped = ok.groupby(["target", "feature_set", "model"], as_index=False)
@@ -3187,11 +3552,13 @@ def _sanitized_command_line(args: argparse.Namespace) -> str:
         "--paired-bootstrap-rounds": args.paired_bootstrap_rounds,
         "--shap-background": args.shap_background,
         "--shap-test": args.shap_test,
+        "--shap-chunk-size": args.shap_chunk_size,
         "--gpu-monitor-interval": args.gpu_monitor_interval,
         "--minimum-free-gb": args.minimum_free_gb,
     }
     for option, value in scalar_options.items():
         parts.extend([option, str(value)])
+    parts.extend(["--tabpfn-checkpoint-sha256", str(args.tabpfn_checkpoint_sha256)])
     parts.extend(["--models", *map(str, args.models)])
     flag_options = {
         "--parallel-cv-temporal": args.parallel_cv_temporal,
@@ -3217,6 +3584,25 @@ def save_reproducibility(output_root: Path, args: argparse.Namespace, feature_se
         params[key] = _metadata_path(params.get(key, ""), args.record_absolute_paths)
     params["feature_sets"] = feature_sets
     params["expected_feature_counts"] = EXPECTED_FEATURE_COUNTS
+    params["endpoint_semantics"] = {
+        "OS": "fixed-time overall survival event status",
+        "TTR": "fixed-time recurrence-only event status",
+    }
+    params["tabpfn_policy"] = {
+        "policy": TABPFN_POLICY,
+        "checkpoint_sha256": args.tabpfn_checkpoint_sha256,
+        "default_constructor_allowed": False,
+        "remote_download_allowed": False,
+        "cpu_fallback_allowed": False,
+    }
+    params["shap_policy"] = {
+        "outer_folds": 5,
+        "held_out_test_only": True,
+        "background_max": args.shap_background,
+        "test_cap_per_fold": args.shap_test,
+        "chunk_size": args.shap_chunk_size,
+        "patient_level_oof_pooling": True,
+    }
     params["v8_variable_role_schema"] = {
         "continuous": sorted(V8_CONTINUOUS_COLUMNS),
         "categorical": sorted(V8_CATEGORICAL_COLUMNS),
@@ -3346,10 +3732,10 @@ def validate_temporal_s3_definition() -> None:
     """Fail fast if the public main program no longer matches the prespecified S3 design."""
     expected = {
         "development_start": pd.Timestamp("2015-10-05"),
-        "development_end": pd.Timestamp("2019-06-30"),
-        "gap_start": pd.Timestamp("2019-07-01"),
-        "gap_end": pd.Timestamp("2019-09-30"),
-        "validation_start": pd.Timestamp("2019-10-01"),
+        "development_end": pd.Timestamp("2019-09-30"),
+        "gap_start": pd.Timestamp("2019-10-01"),
+        "gap_end": pd.Timestamp("2019-12-31"),
+        "validation_start": pd.Timestamp("2020-01-01"),
         "validation_end": pd.Timestamp("2020-12-25"),
         "split_name": "S3_gap3m_2019Q4_to_2020",
     }
@@ -3385,10 +3771,11 @@ def preflight(args: argparse.Namespace, output_root: Path) -> Tuple[pd.DataFrame
         raise FileNotFoundError(f"输入文件不存在: {excel}")
     if not fold.exists():
         raise FileNotFoundError(f"固定折文件不存在: {fold}")
-    if "TabPFN" in args.models and args.tabpfn_checkpoint and not Path(args.tabpfn_checkpoint).exists():
-        raise FileNotFoundError(f"TabPFN checkpoint 不存在: {args.tabpfn_checkpoint}")
+    if "TabPFN" in args.models:
+        validate_tabpfn_checkpoint(args.tabpfn_checkpoint, args.tabpfn_checkpoint_sha256)
     df = canonicalize_columns(pd.read_excel(excel, sheet_name=args.sheet))
     detect_duplicate_columns(df.columns)
+
     id_col = args.id_col or find_first_existing(df.columns.tolist(), ID_CANDIDATES)
     if not id_col:
         raise ValueError("未找到患者 ID 列，请使用 --id-col 指定")
@@ -3469,7 +3856,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-col", default=TIME_COL_DEFAULT)
     parser.add_argument("--id-col", default="", help="Patient ID column; auto-detected when omitted")
     parser.add_argument("--icpi-feature-file", default="", help="Optional explicit 56-feature ICPI list in JSON/CSV/XLSX; default requires exactly 56 eligible columns")
-    parser.add_argument("--tabpfn-checkpoint", default=os.environ.get("TABPFN_CHECKPOINT", ""), help="Optional local TabPFN checkpoint; may also be supplied through TABPFN_CHECKPOINT")
+    parser.add_argument("--tabpfn-checkpoint", default=os.environ.get("TABPFN_CHECKPOINT", ""), help="Required local TabPFN checkpoint when TabPFN is selected; default/download fallback is forbidden")
+    parser.add_argument("--tabpfn-checkpoint-sha256", default=os.environ.get("TABPFN_CHECKPOINT_SHA256", EXPECTED_TABPFN_CHECKPOINT_SHA256), help="Expected SHA256 of the audited local checkpoint")
     parser.add_argument("--feature-set-workers", type=int, default=3)
     parser.add_argument("--model-n-jobs", type=int, default=2, help="Threads per model during internal CV")
     parser.add_argument("--temporal-model-n-jobs", type=int, default=1, help="Threads per tree model during S3 temporal validation")
@@ -3480,9 +3868,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal-bootstrap-rounds", type=int, default=DEFAULT_TEMPORAL_BOOTSTRAP_ROUNDS, help="Temporal validation bootstrap confidence-interval rounds")
     parser.add_argument("--paired-bootstrap-rounds", type=int, default=DEFAULT_PAIRED_BOOTSTRAP_ROUNDS, help="Temporal paired AUROC bootstrap rounds versus TabPFN")
     parser.add_argument("--models", nargs="+", default=ALL_MODELS, choices=ALL_MODELS)
-    parser.add_argument("--skip-shap", action="store_true", help="Skip fold-1 TabPFN generic SHAP")
+    parser.add_argument(
+        "--targets",
+        nargs="+",
+        default=ALL_TARGETS,
+        choices=ALL_TARGETS,
+        help="Run only selected fixed-time endpoints; default: all 10 endpoints",
+    )
+    parser.add_argument(
+        "--feature-sets",
+        nargs="+",
+        default=FEATURE_SET_ORDER,
+        choices=FEATURE_SET_ORDER,
+        help="Run only selected feature sets: classic_preop, postop_total, full_data",
+    )
+    parser.add_argument(
+        "--partial-cv-only",
+        action="store_true",
+        help="Run only the requested internal-CV/SHAP subset; skip temporal validation and global final aggregation",
+    )
+    parser.add_argument("--skip-shap", action="store_true", help="Skip five-fold held-out OOF TabPFN SHAP")
     parser.add_argument("--shap-background", type=int, default=60)
-    parser.add_argument("--shap-test", type=int, default=40)
+    parser.add_argument("--shap-test", type=int, default=0, help="Held-out SHAP test cap per fold; 0 explains all test patients (R9.3 default)")
+    parser.add_argument("--shap-chunk-size", type=int, default=8, help="Permutation-SHAP chunk size; R9.3 used 8")
     parser.add_argument("--save-fold-data", action="store_true", help="Save raw/processed matrices once per target-feature set-fold; uses substantial disk")
     parser.add_argument("--gpu-monitor-interval", type=int, default=30)
     parser.add_argument("--minimum-free-gb", type=float, default=15.0)
@@ -3497,8 +3905,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.sheet = coerce_sheet_arg(args.sheet)
-    if args.feature_set_workers != 3:
-        raise ValueError("The prespecified analysis uses exactly three feature-set workers; set --feature-set-workers 3")
+    if args.feature_set_workers < 1 or args.feature_set_workers > 3:
+        raise ValueError("--feature-set-workers must be between 1 and 3")
     if args.model_n_jobs < 1:
         raise ValueError("--model-n-jobs 必须 >=1")
     if args.temporal_model_n_jobs < 1:
@@ -3512,12 +3920,22 @@ def main() -> None:
 
     cleaned_df, id_col, cnlc_col, bclc_col, feature_sets = preflight(args, output_root)
     args.id_col = id_col
+
+    # Keep the complete feature registry after strict preflight. Partial runs
+    # select workers separately so preprocessing remains identical to a full run.
+    selected_feature_sets = list(args.feature_sets)
     if args.bootstrap_rounds < 1:
         raise ValueError("--bootstrap-rounds 必须 >=1")
     if args.temporal_bootstrap_rounds < 1:
         raise ValueError("--temporal-bootstrap-rounds 必须 >=1")
     if args.paired_bootstrap_rounds < 1:
         raise ValueError("--paired-bootstrap-rounds 必须 >=1")
+    if args.shap_background < 1:
+        raise ValueError("--shap-background must be >=1")
+    if args.shap_test < 0:
+        raise ValueError("--shap-test must be >=0")
+    if args.shap_chunk_size < 1:
+        raise ValueError("--shap-chunk-size must be >=1")
     save_reproducibility(output_root, args, feature_sets)
     if args.preflight_only:
         log_line("Preflight completed successfully; no models were run", output_root / "master.log")
@@ -3527,15 +3945,18 @@ def main() -> None:
         excel_path=str(Path(args.excel).resolve()), sheet_name=args.sheet,
         fold_file=str(Path(args.fold_file).resolve()), output_root=str(output_root),
         time_col=args.time_col, id_col=id_col, cnlc_col=cnlc_col, bclc_col=bclc_col,
-        feature_sets=feature_sets, models=list(args.models),
+        feature_sets=feature_sets, selected_feature_sets=selected_feature_sets,
+        models=list(args.models), targets=list(args.targets),
         tabpfn_checkpoint=str(Path(args.tabpfn_checkpoint).resolve()) if args.tabpfn_checkpoint else "",
+        tabpfn_checkpoint_sha256=args.tabpfn_checkpoint_sha256,
         model_n_jobs=args.model_n_jobs,
         temporal_model_n_jobs=args.temporal_model_n_jobs,
         bootstrap_rounds=args.bootstrap_rounds,
         gpu_concurrency=args.gpu_concurrency,
         gpu_lock_dir=str(output_root / "reproducibility" / "gpu_slots"),
         run_shap=not args.skip_shap, shap_background=args.shap_background,
-        shap_test=args.shap_test, save_fold_data=args.save_fold_data,
+        shap_test=args.shap_test, shap_chunk_size=args.shap_chunk_size,
+        save_fold_data=args.save_fold_data,
         save_direct_identifiers=args.save_direct_identifiers,
     )
 
@@ -3543,6 +3964,18 @@ def main() -> None:
     monitor.start()
     try:
         context = mp.get_context("spawn")
+
+        if args.partial_cv_only:
+            log_line(
+                f"Partial CV/SHAP mode | targets={list(args.targets)} | "
+                f"feature_sets={list(args.feature_sets)} | models={list(args.models)}",
+                output_root / "master.log",
+            )
+            with ProcessPoolExecutor(max_workers=args.feature_set_workers, mp_context=context) as executor:
+                run_phase_in_executor(executor, run_cv_feature_set_worker, "partial internal CV/SHAP", cfg)
+            log_line("Partial CV/SHAP subset completed successfully", output_root / "master.log")
+            return
+
         if args.parallel_cv_temporal:
             log_line(
                 "Parallel schedule enabled: 3 CV feature-set workers + 1 temporal worker; "
@@ -3572,8 +4005,23 @@ def main() -> None:
             )
         cv_summary = summarize_cv(output_root)
         temporal_summary = summarize_temporal(output_root)
-        shap_long = aggregate_shap(output_root / "cv", output_root / "summary")
+        if args.skip_shap or "TabPFN" not in args.models:
+            shap_long = pd.DataFrame(
+                columns=["feature", "mean_abs_shap", "rank", "target", "feature_set", "model"]
+            )
+        else:
+            shap_long = aggregate_shap(output_root / "cv", output_root / "summary")
         export_source_data(output_root, cv_summary, temporal_summary, shap_long, feature_sets)
+        save_json({
+            "status": "PASS",
+            "official_results_valid": True,
+            "targets": ALL_TARGETS,
+            "five_fold_cv_complete": True,
+            "tabpfn_policy": TABPFN_POLICY if "TabPFN" in args.models else "not_run",
+            "tabpfn_fallback_allowed": False,
+            "fivefold_oof_shap_complete": bool(args.skip_shap is False and "TabPFN" in args.models),
+            "temporal_split": TEMPORAL_SPLIT_NAME,
+        }, output_root / "FINAL_RELEASE_AUDIT.json")
     finally:
         monitor.stop()
 

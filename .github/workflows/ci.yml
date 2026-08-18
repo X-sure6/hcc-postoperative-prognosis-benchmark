@@ -1,0 +1,17 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      # CI does not install TabPFN/PyTorch or access private data/GPU.
+      - run: pip install numpy pandas scikit-learn==1.6.1 matplotlib openpyxl statsmodels
+      - run: python -m py_compile hcc_postoperative_prognosis_benchmark.py cgh_supplementary_analyses.py tools/*.py tests/*.py
+      - run: PYTHONPATH=. python -m unittest discover -s tests -v

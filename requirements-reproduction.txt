@@ -1,5 +1,6 @@
-# Install a CUDA-compatible PyTorch build separately before TabPFN GPU execution.
-# R9.3 reproduction used Python 3.12.3 and PyTorch 2.10.0.
+# Key audited versions for OLD-V8/R9.3 reproduction.
+# Python: 3.12.3
+# PyTorch: 2.10.0 with a CUDA build appropriate for the host GPU (install separately).
 numpy>=1.26,<3
 pandas>=2.2,<3
 scikit-learn==1.6.1

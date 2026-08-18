@@ -1,0 +1,2 @@
+-r requirements-reproduction.txt
+lifelines>=0.30,<1

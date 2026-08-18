@@ -1,271 +1,235 @@
-# HCC Postoperative Prognosis Benchmark
+# HCC Postoperative Prognosis Benchmark — CGH/TTR audited release
 
-This repository contains the reproducible analysis pipeline used to benchmark
-postoperative prognostic models for hepatocellular carcinoma (HCC) across
-multiple fixed postoperative time horizons.
+This repository contains the public analysis code for fixed-time postoperative
+risk prediction after hepatocellular carcinoma surgery. The final release uses
+**overall survival (OS)** and **time to recurrence (TTR)** at 12, 24, 36, 48 and
+60 months. Recurrence-only fixed-time outcomes are represented exclusively as
+`TTR12m`–`TTR60m` throughout the public code and input contract.
 
-The workflow includes:
+Private patient-level data, fixed-fold assignments and the TabPFN checkpoint are
+**not** included.
 
-- strict reuse of prespecified five-fold internal cross-validation assignments;
-- three clinicopathological feature configurations: PCI, PPEI, and ICPI;
-- comparisons among TabPFN, TabNet, XGBoost, LightGBM, Random Forest, CNLC, and BCLC;
-- the sole prespecified S3 3-month interval-gap temporal validation;
-- bootstrap confidence intervals, calibration assessment, decision-curve analysis,
-  paired AUROC comparisons, and optional SHAP analysis;
-- a locked V8 variable-role schema, deterministic source-value cleaning,
-  derived-indicator reconciliation, and auditable data-quality checks;
-- optional concurrent CV and temporal execution with process-level GPU admission control.
+## What changed from the earlier V8 repository
 
-Patient-level data, fixed-fold assignments, model checkpoints, and generated
-results are not included because they may contain sensitive or
-institution-specific information.
+- Active recurrence endpoints are `TTR12m`–`TTR60m` only; unsupported endpoint names
+  fail validation rather than being silently aliased.
+- Binary outcomes must already be encoded as `0/1`; values such as `{1,2}` are
+  never silently remapped.
+- Fixed folds are strict: every analyzable patient must appear exactly once as a
+  held-out test patient across the five outer folds, and any failed fold aborts
+  the configuration. Partial OOF results are never ranked as official results.
+- TabPFN uses one explicit local checkpoint on CUDA. Default-constructor,
+  remote-download and CPU fallback are forbidden.
+- The audited checkpoint SHA256 is
+  `5d7170e2d3af01f9c501bb09ec3bd12e9944f8604de18002c647873c6ec04a12`.
+- R9.3 reproduction used `tabpfn==6.4.1`, random seed 42 and the local v2.5
+  classifier checkpoint.
+- SHAP is computed in **all five held-out outer folds**, then pooled exactly once
+  per analyzable patient. The default is background `<=60`, no held-out test cap
+  (`--shap-test 0`), chunk size 8 and permutation-SHAP
+  `max_evals=max(2*n_features+1, 101)`.
+- Historical/reference prediction comparison is post-run diagnostic only and
+  never blocks SHAP generation.
+- The sole temporal experiment is S3:
+  - development: 2015-10-05 to 2019-09-30
+  - gap: 2019-10-01 to 2019-12-31
+  - held-out validation: 2020-01-01 to 2020-12-25
+  - endpoints: OS12m, OS24m, TTR12m, TTR24m.
+- A separate `cgh_supplementary_analyses.py` implements the fixed-endpoint CGH
+  robustness analyses and reads five-fold SHAP stability from the primary run.
 
-## Repository structure
+## Repository layout
 
 ```text
-.
-├── hcc_postoperative_prognosis_benchmark.py
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── .gitattributes
-└── GITHUB_UPLOAD_CHECKLIST.md
+hcc_postoperative_prognosis_benchmark.py   primary CV + S3 temporal + OOF SHAP
+cgh_supplementary_analyses.py              CGH supplementary analyses
+requirements.txt
+requirements-reproduction.txt
+REPRODUCIBILITY.md
+CHANGELOG.md
+tools/
+  validate_r93_reference_bundle.py
+tests/
+.github/workflows/ci.yml
 ```
 
-## Analysis design
+## Input contract
 
-### Internal cross-validation
+### Analysis workbook
 
-The pipeline strictly reuses an existing fold-long file and never silently
-generates replacement folds.
+The private workbook must contain 330 patient rows in the study dataset and the
+10 fixed-time endpoints:
 
-| Feature configuration | Internal name | Number of features |
-|---|---|---:|
-| Preoperative clinical indicators (PCI) | `classic_preop` | 22 |
-| Postoperative and pathology-enhanced indicators (PPEI) | `postop_total` | 41 |
-| Integrated clinical-pathway indicators (ICPI) | `full_data` | 56 |
+```text
+OS12m OS24m OS36m OS48m OS60m
+TTR12m TTR24m TTR36m TTR48m TTR60m
+```
 
-Continuous tumour size is represented by the largest recorded diameter.
-The binary indicator `Tumor Size >5 cm` is included only in ICPI.
+The program expects the prespecified PCI/PPEI/ICPI feature counts 22/41/56,
+plus an initial-treatment date (`初始治疗时间` by default). `Tumor Size >5 cm`
+is ICPI-only; continuous tumour size is included in all three feature sets.
 
-### Audited V8 preprocessing
+### Fixed-fold file
 
-The public program locks the 56 V8 predictors to 31 continuous and 25
-categorical roles rather than inferring variable type separately within each
-fold. This prevents continuous laboratory measurements containing occasional
-source strings from being interpreted as high-cardinality categorical
-variables.
-
-Before split-local preprocessing, the program:
-
-- converts prespecified continuous variables to finite numeric values or missing;
-- parses HBV-DNA conservatively and does not substitute RNA-only measurements;
-- normalises the prespecified surgical-approach categories;
-- converts prespecified treatment variables to binary values;
-- represents multidimensional tumour size by the largest recorded diameter;
-- reconciles deterministic indicators for AFP >400, tumour size >5 cm,
-  margin <=1 cm, MVI presence, and tumour budding presence;
-- exports cleaning, variable-role, derived-indicator, and manual-review audits.
-
-Critical source-value flags stop execution by default. `--allow-data-warnings`
-should be used only after the flagged values have been checked against the
-source record. Direct patient identifiers remain excluded from audit outputs
-unless `--save-direct-identifiers` is explicitly enabled.
-
-### Prespecified S3 interval-gap temporal validation
-
-The sole temporal experiment uses the prespecified S3 protocol:
-
-- development period: 2015-10-05 to 2019-06-30;
-- excluded 3-month interval: 2019-07-01 to 2019-09-30;
-- temporal validation period: 2019-10-01 to 2020-12-25;
-- endpoints: OS12m, OS24m, RFS12m, and RFS24m;
-- preprocessing fitted on the complete development set and applied unchanged
-  to the temporal validation set;
-- no internal temporal split and no temporal cross-validation;
-- a fixed classification threshold of 0.5 for every model;
-- temporal calibration estimated with unpenalized scikit-learn logistic regression;
-- a 20-seed TabNet probability-mean ensemble using seeds 42–61 and 100 fixed
-  epochs per member, with GPU cache cleanup after each member.
-
-The program does not search across alternative temporal cut-offs and does not
-select a split according to model performance. S3 is the only temporal
-experiment defined and executed by the public main program.
-
-## Input requirements
-
-### Analysis dataset
-
-Provide a private Excel workbook containing:
-
-- one unique patient identifier column;
-- an initial-treatment-date column, default name `初始治疗时间`;
-- ten binary endpoint columns:
-  `OS12m`, `OS24m`, `OS36m`, `OS48m`, `OS60m`,
-  `RFS12m`, `RFS24m`, `RFS36m`, `RFS48m`, and `RFS60m`;
-- variables required for the 22 PCI, 41 PPEI, and 56 ICPI features;
-- CNLC and BCLC columns when these staging baselines are requested.
-
-The program performs strict checks before model fitting. Unexpected feature
-counts, duplicated columns, missing endpoints, incompatible fixed folds,
-invalid dates, residual decimal commas, unrecognised V8 predictor roles, and
-critical manual-review findings cause an explicit failure.
-
-### Fixed-fold assignment file
-
-The fixed fold-long CSV or Excel file must contain:
+The fold-long file must contain:
 
 ```text
 target, sample_index, sample_id, fold, split
 ```
 
-For every endpoint, folds must be numbered 1–5 and each fold must contain
-`train`, `val`, and `test` assignments. Patient IDs and row indices are checked
-against the analysis dataset.
+with targets already named `TTR*`. Folds must be 1–5 and roles must be
+`train/val/test`. Every analyzable patient must be test exactly once.
+
+### Endpoint naming
+
+Private analysis and fixed-fold files must already use the exact endpoint names
+listed above. The public release does not perform endpoint-name migration or aliasing.
+
 
 ## Installation
 
-Python 3.10 or 3.11 is recommended. For GPU execution, install a PyTorch build
-compatible with the CUDA version on the target machine before installing the
-remaining dependencies.
+Use Python 3.12.3 for the closest R9.3 environment. Install a CUDA-compatible
+PyTorch build separately (R9.3 used PyTorch 2.10.0), then:
 
 ```bash
 python -m venv .venv
-```
-
-Linux or macOS:
-
-```bash
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements-reproduction.txt
+# For optional KM/CIF/Cox CGH analyses:
+# pip install -r requirements-cgh.txt
 ```
 
-Windows PowerShell:
+Windows PowerShell activation:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
 ```
 
-## TabPFN checkpoint
 
-A local checkpoint can be supplied as a command-line argument:
+## Optional subset execution for reproducibility testing
 
-```bash
---tabpfn-checkpoint /path/to/tabpfn_checkpoint.ckpt
-```
-
-or through the `TABPFN_CHECKPOINT` environment variable.
-
-## Usage
-
-### Preflight checks only
+The primary program can run a prespecified subset of internal CV/SHAP tasks without
+changing preprocessing, fixed folds, TabPFN construction or SHAP computation:
 
 ```bash
 python hcc_postoperative_prognosis_benchmark.py \
-  --excel /path/to/private_analysis_data.xlsx \
-  --fold-file /path/to/fixed_fold_long.csv \
-  --output outputs/hcc_postoperative_prognosis_benchmark \
+  --excel V8_TTR.xlsx \
+  --fold-file CV_Fold_Assignments_Long_TTR.xlsx \
+  --models TabPFN \
+  --targets OS12m \
+  --feature-sets classic_preop \
+  --partial-cv-only \
+  --feature-set-workers 1 \
+  --tabpfn-checkpoint /private/path/tabpfn-v2.5-classifier-v2.5_default.ckpt \
+  --output outputs/os12_pci
+```
+
+This mode skips temporal validation and global final aggregation and is intended for
+parallel reproduction/smoke testing. A full official run should omit these subset flags.
+
+## Strict preflight
+
+A CPU-only preflight can be run without TabPFN by selecting a non-TabPFN model:
+
+```bash
+python hcc_postoperative_prognosis_benchmark.py \
+  --excel /private/V8_TTR.xlsx \
+  --fold-file /private/CV_Fold_Assignments_Long_TTR.xlsx \
+  --models RandomForest \
+  --output outputs/preflight \
   --preflight-only
 ```
 
-### Complete analysis
+If the source-value audit contains clinically verified exceptional values, use
+`--allow-data-warnings` only after source-record review.
+
+## Full audited run
 
 ```bash
 python hcc_postoperative_prognosis_benchmark.py \
-  --excel /path/to/private_analysis_data.xlsx \
-  --fold-file /path/to/fixed_fold_long.csv \
-  --tabpfn-checkpoint /path/to/tabpfn_checkpoint.ckpt \
-  --output outputs/hcc_postoperative_prognosis_benchmark
+  --excel /private/V8_TTR.xlsx \
+  --fold-file /private/CV_Fold_Assignments_Long_TTR.xlsx \
+  --tabpfn-checkpoint /private/tabpfn-v2.5-classifier-v2.5_default.ckpt \
+  --tabpfn-checkpoint-sha256 5d7170e2d3af01f9c501bb09ec3bd12e9944f8604de18002c647873c6ec04a12 \
+  --output outputs/final
 ```
 
-The default thread settings preserve the original component protocols:
+Do **not** use `--skip-shap` for the final five-fold OOF-SHAP release.
+
+Important defaults:
 
 ```text
---model-n-jobs 2
---temporal-model-n-jobs 1
---gpu-concurrency 1
+random state                  42
+outer folds                    5
+SHAP background               60
+SHAP held-out test cap         0 (all patients)
+SHAP chunk size                8
+internal bootstrap           500
+S3 temporal threshold        0.5
 ```
 
-For a Linux GPU server, CV and temporal phases can be scheduled concurrently:
+## Mean AUROC vs pooled OOF AUROC
+
+These two estimates are intentionally kept separate:
+
+- **five-fold Mean AUROC**: arithmetic mean of the five held-out-fold AUROCs;
+  used for the primary internal model-ranking summary/Fig. 2.
+- **pooled OOF AUROC**: all held-out predictions concatenated and AUROC computed
+  once; used for pooled ROC/PR, calibration, DCA and bootstrap analyses.
+
+Do not mix the two definitions in the same ranking statement.
+
+## CGH supplementary analyses
+
+The final CGH helper consumes the same TTR-labelled input/folds and a patient-level
+OOF prediction table:
 
 ```bash
-python hcc_postoperative_prognosis_benchmark.py \
-  --excel /path/to/private_analysis_data.xlsx \
-  --fold-file /path/to/fixed_fold_long.csv \
-  --tabpfn-checkpoint /path/to/tabpfn_checkpoint.ckpt \
-  --output outputs/hcc_postoperative_prognosis_benchmark \
-  --parallel-cv-temporal \
-  --gpu-concurrency 1
+python cgh_supplementary_analyses.py \
+  --excel /private/V8_TTR.xlsx \
+  --fold-file /private/CV_Fold_Assignments_Long_TTR.xlsx \
+  --oof-predictions /private/oof_predictions_all_V8_R93_merged.csv \
+  --primary-output outputs/final \
+  --output outputs/cgh_supplementary \
+  --modules all
 ```
 
-`--gpu-concurrency 1` is the recommended starting point for a 24-GB GPU. The
-cross-process GPU slot lock uses the Linux `fcntl` facility. On systems without
-`fcntl`, do not enable parallel CV/temporal execution unless GPU memory safety
-has been established independently.
+It provides:
 
-Display all command-line options:
+1. BCLC 0/A, tumour <=5 cm and solitary-HCC restricted-cohort analyses
+   (OS36m/TTR24m);
+2. an L2-logistic comparator over 30 endpoint × feature-set configurations;
+3. paired PCI→PPEI→ICPI OOF incremental-value bootstrap analyses;
+4. OS36 risk-tertile KM, TTR24 competing-risk CIF and penalized Cox/cause-specific Cox
+   when an independently audited `--survival-data` file is supplied; otherwise a transparent
+   **SKIPPED** record is written (fixed-time labels are never used to fabricate continuous times);
+5. S3 case-mix SMD/CV-vs-temporal comparison when `--temporal-predictions` is supplied;
+6. five-fold SHAP stability copied from the primary audited OOF-SHAP output.
+
+The final five-fold SHAP computation itself belongs to the primary benchmark,
+not to the supplementary helper.
+
+## R9.3 reference-bundle audit
+
+A private R9.3 result bundle can be checked structurally without rerunning the GPU:
 
 ```bash
-python hcc_postoperative_prognosis_benchmark.py --help
+python tools/validate_r93_reference_bundle.py /private/R93_reference.zip
 ```
 
-## Privacy-safe defaults
+Hard gates include 30/30 configurations, 150/150 fold tasks, TTR terminology,
+complete OOF coverage and 150 strict no-fallback checkpoint audits. Probability
+changes relative to a historical run are diagnostic, not a SHAP gate.
 
-By default:
+## Privacy-safe GitHub upload
 
-- CV and temporal prediction files do not contain direct patient identifiers;
-- temporal assignment files do not contain exact treatment dates;
-- reproducibility metadata does not expose local absolute paths.
+Do not commit:
 
-The following options are intended only for controlled local analyses and their
-outputs should not be committed to a public repository:
+- patient-level Excel/CSV files;
+- fixed-fold files containing patient identifiers;
+- model checkpoints;
+- patient-level OOF predictions or SHAP arrays;
+- local output directories.
 
-```text
---save-direct-identifiers
---record-absolute-paths
---save-fold-data
-```
-
-Always inspect `git status` before committing files.
-
-## Main outputs
-
-The default output directory is:
-
-```text
-outputs/hcc_postoperative_prognosis_benchmark/
-```
-
-Major subdirectories include:
-
-- root-level `preflight_*.csv` files: feature-set, cleaning, variable-role,
-  derived-indicator, fixed-fold, and manual-review audits;
-- `cv/`: fold-level and pooled internal cross-validation results;
-- `temporal/`: the sole prespecified S3 full-development interval-gap temporal validation results;
-- `summary/`: consolidated result tables and source-data workbooks;
-- `reproducibility/`: parameters, seeds, software metadata, file hashes, and GPU logs.
-
-## Reproducibility notes
-
-- Random seed for non-TabNet models: 42.
-- Internal CV tree-model threads default to 2; S3 temporal tree-model threads default to 1.
-- Temporal bootstrap seeds include the S3 split name for exact deterministic regeneration.
-- Temporal TabNet seeds: 42–61; all 20 probabilities are averaged.
-- The pipeline never silently generates new internal folds.
-- Preprocessing is fitted separately within each CV training fold.
-- S3 temporal preprocessing is fitted once on the complete 2015-10-05 to 2019-06-30 development set.
-- Direct identifiers are used internally only to validate alignment with the
-  prespecified fold file unless explicitly exported.
-- The locked V8 variable-role schema and all execution-relevant CLI settings
-  are recorded in the reproducibility metadata.
-- Optional parallel scheduling changes execution order only; model definitions,
-  folds, preprocessing boundaries, seeds, and evaluation procedures are unchanged.
-
-## Data availability
-
-The repository intentionally excludes patient-level clinical data. Data access
-and sharing must comply with the applicable ethics approval, consent framework,
-institutional policy, and journal requirements.
+Run `git status` before every public push. See `GITHUB_UPLOAD_CHECKLIST.md`.
