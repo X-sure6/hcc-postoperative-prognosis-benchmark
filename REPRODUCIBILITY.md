@@ -38,11 +38,11 @@ For every one of the 10 endpoints × 3 feature sets:
 
 ## Temporal validation
 
-S3 only:
+Prespecified temporal validation split:
 
-- train: 2015-10-05 through 2019-09-30;
-- excluded gap: 2019-10-01 through 2019-12-31;
-- held-out validation: 2020-01-01 through 2020-12-25;
+- train: 2015-10-05 through 2019-06-30;
+- excluded 3-month interval gap: 2019-07-01 through 2019-09-30;
+- held-out validation: 2019-10-01 through 2020-12-25;
 - OS12m, OS24m, TTR12m, TTR24m.
 
 ## Verification levels

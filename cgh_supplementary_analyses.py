@@ -14,7 +14,7 @@ Implemented CGH modules
    five-fold train/validation/test assignments.
 3. Paired PCI -> PPEI -> ICPI incremental value using patient-level OOF bootstrap.
 4. Clinical risk stratification when continuous survival/recurrence data are supplied.
-5. Temporal case-mix SMD and CV-vs-S3 performance comparison when temporal
+5. Temporal case-mix SMD and CV-vs-temporal-validation performance comparison when temporal
    prediction files are supplied.
 6. Penalized Cox/cause-specific Cox sensitivity when continuous data are supplied.
 7. Five-fold SHAP stability is read from the primary benchmark's OOF-SHAP outputs;
@@ -46,7 +46,7 @@ TARGETS = core.ALL_TARGETS
 FEATURES = core.FEATURE_SET_ORDER
 DISPLAY = core.FEATURE_SET_DISPLAY
 RANDOM_STATE = core.RANDOM_STATE
-FINAL_S3 = core.TEMPORAL_SPLIT_NAME
+FINAL_TEMPORAL_SPLIT = core.TEMPORAL_SPLIT_NAME
 
 
 def ensure_dir(p: str | Path) -> Path:
@@ -106,7 +106,7 @@ class DataBundle:
 
 
 def load_data(excel: str | Path, fold_file: str | Path, sheet: Any=0, time_col: str=core.TIME_COL_DEFAULT, id_col: str="") -> DataBundle:
-    core.validate_temporal_s3_definition()
+    core.validate_temporal_definition()
     raw=core.canonicalize_columns(pd.read_excel(excel,sheet_name=sheet))
     core.detect_duplicate_columns(raw.columns)
     id_col=id_col or core.find_first_existing(raw.columns.tolist(),core.ID_CANDIDATES)
@@ -262,8 +262,8 @@ def module_temporal(data:DataBundle,oof:pd.DataFrame,temporal_path:str|Path,out:
     for (t,fs,m),g in tp.groupby(["target","feature_set","model"]):
         if t not in core.TEMPORAL_TARGETS: continue
         cv=oof[(oof.target==t)&(oof.feature_set==fs)&(oof.model==m)]; y=g.y_true.to_numpy(int);p=g.y_prob.to_numpy(float)
-        perf.append({"target":t,"feature_set":fs,"model":m,"S3":FINAL_S3,"temporal_AUROC":safe_auc(y,p),"temporal_AUPRC":safe_ap(y,p),"CV_AUROC":safe_auc(cv.y_true.to_numpy(int),cv.y_prob.to_numpy(float)) if len(cv) else np.nan,"delta_temporal_minus_CV_AUROC":safe_auc(y,p)-safe_auc(cv.y_true.to_numpy(int),cv.y_prob.to_numpy(float)) if len(cv) else np.nan})
-    pd.DataFrame(perf).to_csv(root/"CV_vs_S3_temporal_performance.csv",index=False,encoding="utf-8-sig")
+        perf.append({"target":t,"feature_set":fs,"model":m,"temporal_split":FINAL_TEMPORAL_SPLIT,"temporal_AUROC":safe_auc(y,p),"temporal_AUPRC":safe_ap(y,p),"CV_AUROC":safe_auc(cv.y_true.to_numpy(int),cv.y_prob.to_numpy(float)) if len(cv) else np.nan,"delta_temporal_minus_CV_AUROC":safe_auc(y,p)-safe_auc(cv.y_true.to_numpy(int),cv.y_prob.to_numpy(float)) if len(cv) else np.nan})
+    pd.DataFrame(perf).to_csv(root/"CV_vs_temporal_performance.csv",index=False,encoding="utf-8-sig")
 
 
 def module_shap_stability(primary_output:str|Path,out:Path):
@@ -391,6 +391,6 @@ def main():
     if "shap" in mods:
         if args.primary_output:module_shap_stability(args.primary_output,out)
         else:pd.DataFrame({"status":["SKIPPED"],"reason":["--primary-output not supplied"]}).to_csv(ensure_dir(out/"07_fivefold_SHAP_stability")/"SHAP_NOT_RUN.csv",index=False)
-    save_json({"status":"PASS","endpoint_semantics":"TTR recurrence-only fixed-time classification","S3":FINAL_S3,"modules":mods},out/"CGH_SUPPLEMENTARY_COMPLETION.json")
+    save_json({"status":"PASS","endpoint_semantics":"TTR recurrence-only fixed-time classification","temporal_split":FINAL_TEMPORAL_SPLIT,"modules":mods},out/"CGH_SUPPLEMENTARY_COMPLETION.json")
 
 if __name__=="__main__":main()

@@ -30,10 +30,10 @@ Private patient-level data, fixed-fold assignments and the TabPFN checkpoint are
   `max_evals=max(2*n_features+1, 101)`.
 - Historical/reference prediction comparison is post-run diagnostic only and
   never blocks SHAP generation.
-- The sole temporal experiment is S3:
-  - development: 2015-10-05 to 2019-09-30
-  - gap: 2019-10-01 to 2019-12-31
-  - held-out validation: 2020-01-01 to 2020-12-25
+- The temporal validation uses one prespecified interval-gap split:
+  - development: 2015-10-05 to 2019-06-30
+  - 3-month interval gap: 2019-07-01 to 2019-09-30
+  - held-out validation: 2019-10-01 to 2020-12-25
   - endpoints: OS12m, OS24m, TTR12m, TTR24m.
 - A separate `cgh_supplementary_analyses.py` implements the fixed-endpoint CGH
   robustness analyses and reads five-fold SHAP stability from the primary run.
@@ -41,7 +41,7 @@ Private patient-level data, fixed-fold assignments and the TabPFN checkpoint are
 ## Repository layout
 
 ```text
-hcc_postoperative_prognosis_benchmark.py   primary CV + S3 temporal + OOF SHAP
+hcc_postoperative_prognosis_benchmark.py   primary CV + temporal + OOF SHAP
 cgh_supplementary_analyses.py              CGH supplementary analyses
 requirements.txt
 requirements-reproduction.txt
@@ -166,7 +166,7 @@ SHAP background               60
 SHAP held-out test cap         0 (all patients)
 SHAP chunk size                8
 internal bootstrap           500
-S3 temporal threshold        0.5
+temporal threshold        0.5
 ```
 
 ## Mean AUROC vs pooled OOF AUROC
@@ -204,7 +204,7 @@ It provides:
 4. OS36 risk-tertile KM, TTR24 competing-risk CIF and penalized Cox/cause-specific Cox
    when an independently audited `--survival-data` file is supplied; otherwise a transparent
    **SKIPPED** record is written (fixed-time labels are never used to fabricate continuous times);
-5. S3 case-mix SMD/CV-vs-temporal comparison when `--temporal-predictions` is supplied;
+5. temporal case-mix SMD/CV-vs-temporal comparison when `--temporal-predictions` is supplied;
 6. five-fold SHAP stability copied from the primary audited OOF-SHAP output.
 
 The final five-fold SHAP computation itself belongs to the primary benchmark,

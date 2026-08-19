@@ -4,7 +4,7 @@
   "tabpfn_policy": "STRICT_LOCAL_CHECKPOINT_NO_FALLBACK_V1",
   "checkpoint_sha256": "5d7170e2d3af01f9c501bb09ec3bd12e9944f8604de18002c647873c6ec04a12",
   "shap_policy": "five outer held-out folds; patient-level OOF aggregation; background<=60; test cap=0; chunk=8; deterministic per-endpoint/per-feature-set/per-fold SHAP seed",
-  "temporal_split": "S3_gap3m_2019Q4_to_2020",
+  "temporal_split": "prespecified_interval_gap_temporal_validation",
   "subset_execution": "--targets/--feature-sets/--partial-cv-only available for reproducibility scheduling",
   "files": [
     {
@@ -25,7 +25,7 @@
     {
       "path": "CHANGELOG.md",
       "bytes": 1127,
-      "sha256": "6d1e7b49404935146fdc5bd852714bd84ac789d187c5a3c614810eb3042d98c9"
+      "sha256": "c7bbe1bb508d67554970676bd3d7ec58965ecfb89c720ea70bc85fea7701c95d"
     },
     {
       "path": "ENDPOINT_NAMING_AUDIT.txt",
@@ -40,12 +40,12 @@
     {
       "path": "README.md",
       "bytes": 8247,
-      "sha256": "62efbc04e0549a5d090ab498edf55a1595295b8970787527ef7d161991f16192"
+      "sha256": "2889eccd7edc59c39c5aade378a2a67193624252c5d3f3058a876035c11bd412"
     },
     {
       "path": "REPRODUCIBILITY.md",
       "bytes": 2069,
-      "sha256": "22288e4c0ac57c76a3150723776ff10aec776ff2bdb5928e79fd4e2c28e58868"
+      "sha256": "9a8d44015b0f4eeddd1dcb21aa5290f9454a035856a42ebead6c4cb33ec74bb6"
     },
     {
       "path": "REPRODUCTION_TEST_REPORT.md",
@@ -55,12 +55,12 @@
     {
       "path": "cgh_supplementary_analyses.py",
       "bytes": 26173,
-      "sha256": "0b551c57bf842c71cbd5e4b4a4d282d903ec1de876353a8a2b376ad1d61793bc"
+      "sha256": "fa307df3c65cfa25e59e70e0b585508f24e3430ec8a2c73563a5b5284919ceed"
     },
     {
       "path": "hcc_postoperative_prognosis_benchmark.py",
       "bytes": 183852,
-      "sha256": "60365e0a3817b1b5fb6ec55101f64708abbc0f761fb1e1d4b662039a8ee7f0f1"
+      "sha256": "f5f8e2cfc24ad65bcc9ef68cc70b090249a16ca19097279169a8909e4e1c07cb"
     },
     {
       "path": "requirements-cgh.txt",
@@ -85,7 +85,7 @@
     {
       "path": "tests/test_core_contracts.py",
       "bytes": 1400,
-      "sha256": "46a483e1783dcc9247af0df3e3aedf1e7a9831d4164269f9dad5d96c434f4fcf"
+      "sha256": "3a732bfed4c7891798fb56f82f0792444f5a6a8eb70e95ba70809f06dc65d669"
     },
     {
       "path": "tests/test_no_fallback_static.py",

@@ -16,11 +16,14 @@ class CoreContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             core.validate_endpoint_names(["OS12m","REC12m"],"test",allow_subset=True)
 
-    def test_final_s3_definition(self):
-        core.validate_temporal_s3_definition()
-        self.assertEqual(str(core.TEMPORAL_DEV_END.date()),"2019-09-30")
-        self.assertEqual(str(core.TEMPORAL_GAP_START.date()),"2019-10-01")
-        self.assertEqual(str(core.TEMPORAL_VAL_START.date()),"2020-01-01")
+    def test_temporal_definition(self):
+        core.validate_temporal_definition()
+        self.assertEqual(str(core.TEMPORAL_DEV_START.date()),"2015-10-05")
+        self.assertEqual(str(core.TEMPORAL_DEV_END.date()),"2019-06-30")
+        self.assertEqual(str(core.TEMPORAL_GAP_START.date()),"2019-07-01")
+        self.assertEqual(str(core.TEMPORAL_GAP_END.date()),"2019-09-30")
+        self.assertEqual(str(core.TEMPORAL_VAL_START.date()),"2019-10-01")
+        self.assertEqual(str(core.TEMPORAL_VAL_END.date()),"2020-12-25")
 
     def test_all_targets_use_os_and_ttr(self):
         self.assertEqual(len(core.ALL_TARGETS),10)
