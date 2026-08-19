@@ -233,3 +233,10 @@ Do not commit:
 - local output directories.
 
 Run `git status` before every public push. See `GITHUB_UPLOAD_CHECKLIST.md`.
+
+## Citation
+
+The final analysis code is archived on Zenodo:
+
+**Version v1.4.0:** https://doi.org/10.5281/zenodo.22007130
+
